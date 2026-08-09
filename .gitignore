@@ -1,1 +1,8 @@
 /scratch
+
+# Rust / cargo
+/target
+
+# Nix build output symlinks
+/result
+/result-*

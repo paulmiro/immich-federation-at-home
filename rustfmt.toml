@@ -1,0 +1,4 @@
+# Conservative, stable-only rustfmt config (rustfmt 1.9.0 / edition 2024).
+# Everything else is left at rustfmt's stable defaults.
+edition = "2024"
+newline_style = "Unix"
