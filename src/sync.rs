@@ -292,7 +292,7 @@ impl SyncContext {
         for id in &outcome.added {
             let filename = album_targets.get(id).map_or("(unknown)", String::as_str);
             info!(
-                "added to album filename={filename} import_id={id} album_id={}",
+                "added to album filename={filename} import_id={id} import_album_id={}",
                 self.import_album_id
             );
         }
@@ -302,8 +302,9 @@ impl SyncContext {
             let filename = album_targets.get(id).map_or("(unknown)", String::as_str);
             error!(
                 "failed to add asset to the import album filename={filename} import_id={id} \
-                 album_id={} reason={reason:?}",
-                self.import_album_id
+                 import_album_id={} reason={}",
+                self.import_album_id,
+                album_add_error_str(*reason)
             );
             failed_count += 1;
         }
@@ -489,6 +490,21 @@ struct ClassifiedAssets {
 /// asset" log line (`PLAN.md` §8's example shows `status=created`, lowercase — the derived
 /// `Debug` on the enum would print `Created`). Kept local to this module rather than adding
 /// a `Display` impl to the DTO type, since nothing else needs one.
+/// The wire spelling of an I6 per-item failure reason, for the log line — same reasoning as
+/// [`status_str`]: `{:?}` on the `Option` would print Rust syntax (`Some(NoPermission)`) at an
+/// operator who has only ever seen the JSON spelling.
+fn album_add_error_str(reason: Option<dto::BulkIdErrorReason>) -> &'static str {
+    match reason {
+        Some(dto::BulkIdErrorReason::Duplicate) => "duplicate",
+        Some(dto::BulkIdErrorReason::NoPermission) => "no_permission",
+        Some(dto::BulkIdErrorReason::NotFound) => "not_found",
+        Some(dto::BulkIdErrorReason::Unknown) => "unknown",
+        Some(dto::BulkIdErrorReason::Validation) => "validation",
+        Some(dto::BulkIdErrorReason::Unrecognized) => "unrecognized",
+        None => "(none given)",
+    }
+}
+
 fn status_str(status: dto::AssetMediaStatus) -> &'static str {
     match status {
         dto::AssetMediaStatus::Created => "created",

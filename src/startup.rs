@@ -212,9 +212,13 @@ impl StartupSummary {
             .share_link_expires_at
             .map_or_else(|| "never".to_owned(), |t| t.to_rfc3339());
         info!(
+            // Field labels use the same export/import vocabulary as the environment
+            // variables an operator configured, so a log line and the config it came from
+            // name the same thing the same way. (The struct's own fields keep the
+            // source/target role names — they describe the data flow, not the config.)
             "startup complete export_version={} import_version={} share_link_id={} \
-             share_link_type={} share_link_expires_at={expires_at} source_album={:?} \
-             source_asset_count={} target_album={:?} target_album_id={} interval={} \
+             share_link_type={} share_link_expires_at={expires_at} export_album={:?} \
+             export_asset_count={} import_album={:?} import_album_id={} interval={} \
              concurrency={}",
             self.export_version,
             self.import_version,
