@@ -1,0 +1,136 @@
+# Two complete, independent Immich stacks (server + postgres + redis each; the ML container
+# is deliberately omitted — nothing this program does needs it, and the tests/e2e suite that
+# drives this file never exercises face/object detection or smart search).
+#
+# Service configuration, image names and required environment are copied from Immich's own
+# published `docker/docker-compose.yml` and `docker/example.env`
+# (https://github.com/immich-app/immich/blob/v3.1.0/docker/docker-compose.yml), not invented —
+# only the naming (container/volume/network names, ports) was changed, twice over, to run two
+# independent stacks side by side without colliding.
+#
+# Image tag v3.1.0 is pinned (not `:latest`) and satisfies PLAN.md's `>= 3.0.3` export-side
+# floor (and the `>= 3.0.0` import-side floor) with room to spare — it's the exact version this
+# whole plan was written against (see PLAN.md's own header: "API version 3.1.0").
+#
+# Bring up: `docker compose -f tests/e2e/compose.yaml up -d --wait`
+# Tear down: `docker compose -f tests/e2e/compose.yaml down -v`
+#
+# Export stack (the "foreign" instance, reached only via a share link in the real test):
+#   immich UI/API on http://localhost:2283
+# Import stack (mirrors into it via API key):
+#   immich UI/API on http://localhost:2284
+
+name: immich-federation-e2e
+
+services:
+  export-server:
+    container_name: immich-e2e-export-server
+    image: ghcr.io/immich-app/immich-server:v3.1.0
+    environment:
+      DB_HOSTNAME: export-database
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: export-redis
+    volumes:
+      - export-library:/data
+    ports:
+      - '2283:2283'
+    depends_on:
+      - export-redis
+      - export-database
+    networks:
+      - export-net
+    restart: unless-stopped
+    healthcheck:
+      disable: false
+
+  export-redis:
+    container_name: immich-e2e-export-redis
+    image: docker.io/valkey/valkey:9@sha256:8e8d64b405ce18f41b8e5ee20aa4687a8ed0022d1298f2ce31cdcf3a76e09411
+    networks:
+      - export-net
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: unless-stopped
+
+  export-database:
+    container_name: immich-e2e-export-database
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - export-database-data:/var/lib/postgresql/data
+    shm_size: 128mb
+    networks:
+      - export-net
+    restart: unless-stopped
+    healthcheck:
+      disable: false
+
+  import-server:
+    container_name: immich-e2e-import-server
+    image: ghcr.io/immich-app/immich-server:v3.1.0
+    environment:
+      DB_HOSTNAME: import-database
+      DB_USERNAME: postgres
+      DB_PASSWORD: postgres
+      DB_DATABASE_NAME: immich
+      REDIS_HOSTNAME: import-redis
+    volumes:
+      - import-library:/data
+    ports:
+      - '2284:2283'
+    depends_on:
+      - import-redis
+      - import-database
+    networks:
+      - import-net
+    restart: unless-stopped
+    healthcheck:
+      disable: false
+
+  import-redis:
+    container_name: immich-e2e-import-redis
+    image: docker.io/valkey/valkey:9@sha256:8e8d64b405ce18f41b8e5ee20aa4687a8ed0022d1298f2ce31cdcf3a76e09411
+    networks:
+      - import-net
+    healthcheck:
+      test: redis-cli ping || exit 1
+    restart: unless-stopped
+
+  import-database:
+    container_name: immich-e2e-import-database
+    image: ghcr.io/immich-app/postgres:14-vectorchord0.4.3-pgvectors0.2.0@sha256:bcf63357191b76a916ae5eb93464d65c07511da41e3bf7a8416db519b40b1c23
+    environment:
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_USER: postgres
+      POSTGRES_DB: immich
+      POSTGRES_INITDB_ARGS: '--data-checksums'
+    volumes:
+      - import-database-data:/var/lib/postgresql/data
+    shm_size: 128mb
+    networks:
+      - import-net
+    restart: unless-stopped
+    healthcheck:
+      disable: false
+
+networks:
+  export-net:
+    name: immich-federation-e2e-export-net
+  import-net:
+    name: immich-federation-e2e-import-net
+
+volumes:
+  export-library:
+    name: immich-federation-e2e-export-library
+  export-database-data:
+    name: immich-federation-e2e-export-database-data
+  import-library:
+    name: immich-federation-e2e-import-library
+  import-database-data:
+    name: immich-federation-e2e-import-database-data
