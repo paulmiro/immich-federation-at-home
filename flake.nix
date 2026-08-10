@@ -61,18 +61,19 @@
             }
           );
 
-          # apps.update-openapi (task 14 will add scripts/update-openapi.sh; until it exists,
-          # this is a self-contained writeShellApplication that does the fetch itself so
-          # `nix flake check`/`nix run .#update-openapi` work today. Task 14 should either
-          # delete this and point apps.update-openapi at the new script, or have the script
-          # just be this body — whichever is cleaner at that point.)
+          # apps.update-openapi wraps scripts/update-openapi.sh, which is the single source
+          # of truth: this just supplies its runtime deps (curl, jq, git) so `nix run
+          # .#update-openapi` works on a machine with none of them on PATH, then execs the
+          # real script unmodified so it and `./scripts/update-openapi.sh` can't drift.
           update-openapi = pkgs.writeShellApplication {
             name = "update-openapi";
-            runtimeInputs = [ pkgs.curl ];
+            runtimeInputs = [
+              pkgs.curl
+              pkgs.jq
+              pkgs.git
+            ];
             text = ''
-              out="$(git rev-parse --show-toplevel)/openapi/immich-openapi-3.1.0.json"
-              curl -fsSL -o "$out" https://docs.immich.app/openapi.json
-              echo "updated $out"
+              exec "${./scripts/update-openapi.sh}" "$@"
             '';
           };
         in
