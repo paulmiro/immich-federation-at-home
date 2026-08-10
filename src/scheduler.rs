@@ -19,7 +19,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use tokio::sync::Notify;
-use tracing::{error, info};
+
+use crate::{error, info};
 
 use crate::format_error_chain;
 
@@ -114,13 +115,11 @@ where
     loop {
         let result = perform_run().await;
         if let Err(err) = &result {
+            let cause = format_error_chain(err);
             if run_once {
-                error!(error = %format_error_chain(err), "sync run failed");
+                error!("sync run failed: {cause}");
             } else {
-                error!(
-                    error = %format_error_chain(err),
-                    "sync run failed; will try again at the next tick"
-                );
+                error!("sync run failed; will try again at the next tick: {cause}");
             }
         }
 
@@ -137,7 +136,10 @@ where
             return Outcome::ShutdownRequested;
         }
 
-        info!(interval = ?interval, "run complete; sleeping until the next one");
+        info!(
+            "run complete; sleeping until the next one interval={}",
+            humantime::format_duration(interval)
+        );
         tokio::select! {
             () = tokio::time::sleep(interval) => {}
             () = shutdown.wait() => {

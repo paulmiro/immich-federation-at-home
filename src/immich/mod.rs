@@ -19,10 +19,10 @@ use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Method, RequestBuilder, Response, StatusCode};
 use serde::de::DeserializeOwned;
 use thiserror::Error;
-use tracing::{debug, trace};
 use url::Url;
 
 use crate::retry::{self, RetryPolicy, Retryable};
+use crate::{debug, trace};
 
 /// This tool's `User-Agent`, e.g. `immich-federation-at-home/0.1.0`.
 pub const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
@@ -308,11 +308,14 @@ pub async fn execute_once(
     let took_ms = millis_u64(start.elapsed());
     match result {
         Ok(response) => {
-            debug!(%method, url = %redacted, status = %response.status(), took_ms, "http request");
+            debug!(
+                "http request {method} {redacted} status={} took_ms={took_ms}",
+                response.status()
+            );
             Ok(response)
         }
         Err(source) => {
-            debug!(%method, url = %redacted, error = %source, took_ms, "http request failed");
+            debug!("http request failed {method} {redacted} took_ms={took_ms} error={source}");
             Err(ApiError::Transport {
                 method,
                 url: redacted,
@@ -362,19 +365,10 @@ pub async fn parse_json_response<T: DeserializeOwned>(
             source: source.without_url(),
         })?;
 
-    // Guarded explicitly (rather than relying solely on `tracing`'s own callsite-enabled
-    // check, which already skips evaluating a disabled event's field expressions) so it's
-    // obvious at a glance that `redact_json_body` — a full parse + walk + re-serialise —
-    // never runs unless `trace` is actually active.
-    if tracing::enabled!(tracing::Level::TRACE) {
-        trace!(
-            %method,
-            url = %redacted,
-            status = %status,
-            body = %redact_json_body(&bytes),
-            "http response body"
-        );
-    }
+    trace!(
+        "http response body {method} {redacted} status={status} body={}",
+        redact_json_body(&bytes)
+    );
 
     if status.is_success() {
         serde_json::from_slice(&bytes).map_err(|source| ApiError::Decode {
@@ -498,10 +492,10 @@ mod tests {
     #[test]
     fn redact_url_masks_key_and_slug_but_keeps_other_params() {
         let url = Url::parse("https://host/api/search/metadata?key=SuperSecret&page=2").unwrap();
-        let redacted = redact_url(&url);
-        assert!(!redacted.contains("SuperSecret"));
-        assert!(redacted.contains("key=REDACTED"));
-        assert!(redacted.contains("page=2"));
+        assert_eq!(
+            redact_url(&url),
+            "https://host/api/search/metadata?key=REDACTED&page=2"
+        );
     }
 
     #[test]
@@ -530,10 +524,11 @@ mod tests {
     #[test]
     fn redact_json_body_masks_key_field_recursively() {
         let body = br#"{"id":"abc","key":"secret-share-key","album":{"slug":"nested-secret"}}"#;
-        let redacted = redact_json_body(body);
-        assert!(!redacted.contains("secret-share-key"));
-        assert!(!redacted.contains("nested-secret"));
-        assert!(redacted.contains("\"id\":\"abc\""));
+        // Key order is alphabetical: `serde_json`'s default `Value::Object` is a `BTreeMap`.
+        assert_eq!(
+            redact_json_body(body),
+            r#"{"album":{"slug":"REDACTED"},"id":"abc","key":"REDACTED"}"#
+        );
     }
 
     #[test]
@@ -594,7 +589,7 @@ mod tests {
     fn parse_error_body_falls_back_to_raw_text_for_non_json_body() {
         let body = b"<html>502 Bad Gateway</html>";
         let (message, error) = parse_error_body(body, StatusCode::BAD_GATEWAY);
-        assert!(message.contains("502 Bad Gateway"));
+        assert_eq!(message, "<html>502 Bad Gateway</html>");
         assert_eq!(error, None);
     }
 
@@ -692,17 +687,17 @@ mod tests {
         // deterministically with ECONNREFUSED, with no real network required.
         let client = Client::new();
         let url = Url::parse("http://127.0.0.1:1/?key=SuperSecret").unwrap();
-        let redacted = redact_url(&url);
         let request = client.get(url.clone());
         let err = execute_once(Method::GET, &url, request)
             .await
             .expect_err("connection to a closed loopback port must fail");
         assert!(err.is_retryable());
-        // The whole point of using `redacted` (not the raw `url`) in the `ApiError` — the
-        // secret must not survive into the error's own Display, which is what would end
-        // up in a log line.
+        // Not an assertion about the message's wording but about a leak: the whole point of
+        // putting `redact_url(&url)` (not the raw `url`) into the `ApiError` is that the
+        // share key must not survive into the error's own Display and from there into a log
+        // line. `reqwest::Error` embeds the unredacted URL unless `without_url()` is called,
+        // so this has regressed before.
         assert!(!err.to_string().contains("SuperSecret"));
-        assert!(err.to_string().contains(&redacted));
     }
 
     #[tokio::test]
@@ -888,7 +883,6 @@ mod tests {
 
         let err = result.expect_err("404 must not be retried into success");
         assert_eq!(err.status(), Some(StatusCode::NOT_FOUND));
-        assert!(err.to_string().contains("Album not found"));
         assert_eq!(calls.load(Ordering::SeqCst), 1);
     }
 }

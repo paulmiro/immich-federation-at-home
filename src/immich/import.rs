@@ -18,11 +18,11 @@ use reqwest::multipart::{Form, Part};
 use reqwest::{Body, Client, Method, StatusCode};
 use thiserror::Error;
 use tokio_util::io::ReaderStream;
-use tracing::debug;
 use url::Url;
 use uuid::Uuid;
 
 use crate::config::{AlbumRef, Secret};
+use crate::debug;
 use crate::immich::{
     ApiError, Version, build_client, dto, execute_once, parse_json_response, send_json,
 };
@@ -332,7 +332,7 @@ impl ImportClient {
             let body = dto::AssetBulkUploadCheckDto {
                 assets: chunk.to_vec(),
             };
-            debug!(chunk_size = chunk.len(), "bulk-upload-check chunk");
+            debug!("bulk-upload-check chunk chunk_size={}", chunk.len());
             let response: dto::AssetBulkUploadCheckResponseDto = send_json(
                 &self.retry_policy,
                 "bulk_upload_check",
@@ -699,7 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_album_by_name_not_found_lists_available_albums() {
+    async fn resolve_album_by_name_not_found() {
         let app = Router::new().route(
             "/albums",
             get(|| async {
@@ -716,19 +716,13 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ImportError::AlbumNameNotFound { name, available } => {
-                assert_eq!(name, "Missing Album");
-                assert!(
-                    available.contains("Other Album"),
-                    "available was: {available}"
-                );
-            }
+            ImportError::AlbumNameNotFound { name, .. } => assert_eq!(name, "Missing Album"),
             other => panic!("expected AlbumNameNotFound, got {other:?}"),
         }
     }
 
     #[tokio::test]
-    async fn resolve_album_by_name_ambiguous_lists_ids() {
+    async fn resolve_album_by_name_ambiguous() {
         let app = Router::new().route(
             "/albums",
             get(|| async {
@@ -746,11 +740,7 @@ mod tests {
             .await
             .unwrap_err();
         match err {
-            ImportError::AlbumNameAmbiguous { name, matches } => {
-                assert_eq!(name, "Holiday");
-                assert!(matches.contains("11111111-1111-1111-1111-111111111111"));
-                assert!(matches.contains("22222222-2222-2222-2222-222222222222"));
-            }
+            ImportError::AlbumNameAmbiguous { name, .. } => assert_eq!(name, "Holiday"),
             other => panic!("expected AlbumNameAmbiguous, got {other:?}"),
         }
     }

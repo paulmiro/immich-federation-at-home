@@ -1,33 +1,31 @@
 //! `immich-federation-at-home` — mirror a shared Immich album into a local album.
 //!
 //! A thin wiring layer over the `immich_federation_at_home` library crate (`src/lib.rs`):
-//! parse config, validate it, initialise `tracing`, run the `PLAN.md` §5 startup sequence
+//! parse config, validate it, set the log level, run the `PLAN.md` §5 startup sequence
 //! (`startup::run_startup`), then hand the resulting [`sync::SyncContext`] to the scheduler
 //! (`scheduler::run`) until it's time to exit. Every piece with real logic to test lives in
 //! the library (`src/startup.rs`, `src/scheduler.rs`) — this file itself is deliberately not
-//! unit tested, since it's mostly process-global side effects (real argv/env, a
-//! once-per-process `tracing` subscriber, real OS signals, the real process exit code) that
-//! don't have a meaningful in-process test.
+//! unit tested, since it's mostly process-global side effects (real argv/env, the
+//! process-wide log threshold, real OS signals, the real process exit code) that don't have
+//! a meaningful in-process test.
 
 use std::process::ExitCode;
 use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
-use tracing::{error, info, warn};
 
 use immich_federation_at_home::config::Config;
-use immich_federation_at_home::format_error_chain;
 use immich_federation_at_home::scheduler::{self, ShutdownSignal};
-use immich_federation_at_home::startup;
+use immich_federation_at_home::{error, format_error_chain, info, log, startup, warn};
 
 #[tokio::main]
 async fn main() -> ExitCode {
     // PLAN.md §5 step 1: parse config, then its semantic validation (clap's derive already
     // enforces types; `Config::validate` covers the rest — a non-empty API key, non-zero
-    // interval/timeouts/concurrency). No `tracing` subscriber exists yet at this point, so a
-    // failure here is reported the same way clap's own parse errors already are: straight to
-    // stderr, no log formatting.
+    // interval/timeouts/concurrency). The configured log level isn't in effect yet at this
+    // point, so a failure here is reported the same way clap's own parse errors already are:
+    // straight to stderr, no log formatting.
     let config = Config::parse();
     if let Err(err) = config.validate() {
         eprintln!("Error: {err}");
@@ -35,7 +33,7 @@ async fn main() -> ExitCode {
     }
 
     // PLAN.md §5 step 2.
-    init_tracing(&config);
+    log::set_level(config.log_level);
 
     // PLAN.md §5 steps 3-10. Sample output (both success and failure) is in this task's
     // report; every failure here is actionable prose naming the env var or the remote-side
@@ -68,17 +66,6 @@ async fn main() -> ExitCode {
         scheduler::Outcome::RanOnceOk | scheduler::Outcome::ShutdownRequested => ExitCode::SUCCESS,
         scheduler::Outcome::RanOnceFailed => ExitCode::FAILURE,
     }
-}
-
-/// PLAN.md §8: builds the `EnvFilter` from `Config::env_filter_directive` (the
-/// `RUST_LOG`-wins rule and the default per-crate quieting both live there) and installs it
-/// as the process-wide default subscriber. Not unit tested — a global subscriber can only be
-/// installed once per process, which is exactly why this is here rather than in the library;
-/// `sync.rs`'s and `startup.rs`'s own tests use `tracing::subscriber::set_default`'s scoped,
-/// repeatable alternative wherever a test needs to assert on log output.
-fn init_tracing(config: &Config) {
-    let filter = tracing_subscriber::EnvFilter::new(config.env_filter_directive());
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
 
 /// Watches for SIGINT/SIGTERM and turns the first one into a graceful

@@ -8,12 +8,13 @@
 //! all — `main.rs` itself, by design, is never exercised by a test.
 //!
 //! Modules land here incrementally as `PLAN.md` §12's task list works through them; so far
-//! that's configuration parsing, share-link parsing, the shared Immich HTTP plumbing +
-//! DTOs, the retry helper, the per-run sync algorithm, the startup sequence, and the
-//! scheduler.
+//! that's configuration parsing, logging, share-link parsing, the shared Immich HTTP
+//! plumbing + DTOs, the retry helper, the per-run sync algorithm, the startup sequence, and
+//! the scheduler.
 
 pub mod config;
 pub mod immich;
+pub mod log;
 pub mod retry;
 pub mod scheduler;
 pub mod share_url;
@@ -23,13 +24,13 @@ pub mod sync;
 /// Formats an [`anyhow::Error`] and its full cause chain as one single-line,
 /// human-readable string — `"<top message>: <cause 1>: <cause 2>: ..."`.
 ///
-/// This crate's entire logging format (`PLAN.md` §8) is single-line `tracing` events; a
-/// fatal error should go through the same pipe (get a timestamp, respect `RUST_LOG`
-/// filtering, land wherever the configured writer sends everything else) rather than the
-/// Rust runtime's own default `Result`-from-`main` formatting (`Error: ...` followed by a
-/// multi-line `Caused by:` list), which would look inconsistent dropped into the middle of
-/// this program's own log stream. `main.rs` and `scheduler.rs` both use this for exactly
-/// that reason — see their own doc comments for where.
+/// This crate's entire logging format (`PLAN.md` §8) is single-line events; a fatal error
+/// should go through the same pipe (get a timestamp and a level tag, land on the same
+/// stream as everything else) rather than the Rust runtime's own default
+/// `Result`-from-`main` formatting (`Error: ...` followed by a multi-line `Caused by:`
+/// list), which would look inconsistent dropped into the middle of this program's own log
+/// stream. `main.rs` and `scheduler.rs` both use this for exactly that reason — see their
+/// own doc comments for where.
 pub fn format_error_chain(err: &anyhow::Error) -> String {
     err.chain()
         .map(std::string::ToString::to_string)

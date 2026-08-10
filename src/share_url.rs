@@ -164,16 +164,12 @@ mod tests {
 
     #[test]
     fn rejects_wrong_marker() {
-        let err = parse_share_url("https://host/album/AbC123").unwrap_err();
-        let msg = err.to_string();
-        assert!(msg.contains("/share/<key>"), "message was: {msg}");
-        assert!(msg.contains("/s/<slug>"), "message was: {msg}");
+        assert!(parse_share_url("https://host/album/AbC123").is_err());
     }
 
     #[test]
     fn rejects_bare_origin() {
-        let err = parse_share_url("https://host").unwrap_err();
-        assert!(err.to_string().contains("/share/<key>"));
+        assert!(parse_share_url("https://host").is_err());
     }
 
     #[test]

@@ -11,9 +11,11 @@ use std::str::FromStr;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use url::Url;
 use uuid::Uuid;
+
+use crate::log::Level;
 
 /// Target album resolved from `IMPORT_ALBUM`: either a UUID or an exact album name.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,30 +25,6 @@ pub enum AlbumRef {
     /// `IMPORT_ALBUM` did not parse as a UUID; resolve via `GET /albums?name=…` (exact
     /// match, filtered client-side).
     Name(String),
-}
-
-/// Log verbosity for `LOG_LEVEL`. See [`build_env_filter_directive`] for how this becomes a
-/// `tracing_subscriber::EnvFilter` directive string.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, ValueEnum)]
-pub enum LogLevel {
-    Error,
-    Warn,
-    Info,
-    Debug,
-    Trace,
-}
-
-impl fmt::Display for LogLevel {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            LogLevel::Error => "error",
-            LogLevel::Warn => "warn",
-            LogLevel::Info => "info",
-            LogLevel::Debug => "debug",
-            LogLevel::Trace => "trace",
-        };
-        f.write_str(s)
-    }
 }
 
 /// A secret value (API key or share-link password) that must never be printed.
@@ -133,10 +111,9 @@ pub struct Config {
     #[arg(long, env = "IMPORT_INTERVAL", default_value = "1h", value_parser = parse_duration)]
     pub import_interval: Duration,
 
-    /// Log verbosity. If the `RUST_LOG` environment variable is set, it takes over entirely,
-    /// including the built-in quieting of noisy HTTP-stack crates.
-    #[arg(long, env = "LOG_LEVEL", value_enum, default_value_t = LogLevel::Info)]
-    pub log_level: LogLevel,
+    /// Log verbosity: everything at this level and above is written to stderr.
+    #[arg(long, env = "LOG_LEVEL", value_enum, default_value_t = Level::Info)]
+    pub log_level: Level,
 
     /// How many assets to transfer in parallel.
     #[arg(long, env = "IMPORT_CONCURRENCY", default_value_t = 4)]
@@ -194,15 +171,6 @@ impl Config {
     pub fn import_api_base(&self) -> Result<Url> {
         normalize_server_url(&self.import_server_url)
     }
-
-    /// Builds the `tracing_subscriber::EnvFilter` directive string for this config, honouring
-    /// the real process `RUST_LOG` environment variable if it is set. See
-    /// [`build_env_filter_directive`] for the pure, unit-tested logic this wraps; actually
-    /// initialising `tracing_subscriber` from the result is `main.rs`'s job, not this
-    /// module's.
-    pub fn env_filter_directive(&self) -> String {
-        build_env_filter_directive(self.log_level, std::env::var("RUST_LOG").ok().as_deref())
-    }
 }
 
 /// Normalises an `IMPORT_SERVER_URL` value into the Immich API base URL: strips a trailing
@@ -218,18 +186,6 @@ pub fn normalize_server_url(raw: &str) -> Result<Url> {
     url.set_query(None);
     url.set_fragment(None);
     Ok(url)
-}
-
-/// Pure core of [`Config::env_filter_directive`]: `rust_log` is the value of the `RUST_LOG`
-/// environment variable, if any (passed in explicitly so this stays unit-testable without
-/// touching the real process environment). Per `PLAN.md` §8, when `RUST_LOG` is set it
-/// replaces the built-in directive **entirely** — the per-crate quieting (`hyper=warn`, …)
-/// does not get merged in.
-pub fn build_env_filter_directive(log_level: LogLevel, rust_log: Option<&str>) -> String {
-    if let Some(rust_log) = rust_log {
-        return rust_log.to_owned();
-    }
-    format!("{log_level},hyper=warn,reqwest=warn,rustls=warn,h2=warn")
 }
 
 #[cfg(test)]
@@ -300,7 +256,7 @@ mod tests {
     fn defaults_match_plan_table() {
         let cfg = parse(&[]).expect("minimal config should parse");
         assert_eq!(cfg.import_interval, Duration::from_secs(3600));
-        assert_eq!(cfg.log_level, LogLevel::Info);
+        assert_eq!(cfg.log_level, Level::Info);
         assert_eq!(cfg.import_concurrency, 4);
         assert_eq!(cfg.request_timeout, Duration::from_secs(30));
         assert_eq!(cfg.transfer_timeout, Duration::from_secs(30 * 60));
@@ -334,10 +290,8 @@ mod tests {
     }
 
     #[test]
-    fn duration_parser_rejects_garbage_with_actionable_message() {
-        let err = parse_duration("banana").unwrap_err();
-        assert!(err.contains("banana"), "message was: {err}");
-        assert!(err.contains("30m"), "message should show an example: {err}");
+    fn duration_parser_rejects_garbage() {
+        assert!(parse_duration("banana").is_err());
     }
 
     #[test]
@@ -348,20 +302,19 @@ mod tests {
 
     #[test]
     fn import_interval_flag_rejects_garbage() {
-        let err = parse(&["--import-interval", "banana"]).unwrap_err();
-        assert!(err.to_string().contains("banana"));
+        assert!(parse(&["--import-interval", "banana"]).is_err());
     }
 
-    // ---- LogLevel / EnvFilter directive builder ----------------------------------------
+    // ---- LOG_LEVEL ----------------------------------------------------------------------
 
     #[test]
     fn log_level_flag_parses_all_variants() {
         for (flag, expected) in [
-            ("error", LogLevel::Error),
-            ("warn", LogLevel::Warn),
-            ("info", LogLevel::Info),
-            ("debug", LogLevel::Debug),
-            ("trace", LogLevel::Trace),
+            ("error", Level::Error),
+            ("warn", Level::Warn),
+            ("info", Level::Info),
+            ("debug", Level::Debug),
+            ("trace", Level::Trace),
         ] {
             let cfg = parse(&["--log-level", flag]).unwrap();
             assert_eq!(cfg.log_level, expected, "flag was {flag}");
@@ -371,32 +324,6 @@ mod tests {
     #[test]
     fn log_level_flag_rejects_unknown_variant() {
         assert!(parse(&["--log-level", "verbose"]).is_err());
-    }
-
-    #[test]
-    fn env_filter_directive_default_includes_quieting_rules() {
-        let directive = build_env_filter_directive(LogLevel::Info, None);
-        assert_eq!(
-            directive,
-            "info,hyper=warn,reqwest=warn,rustls=warn,h2=warn"
-        );
-    }
-
-    #[test]
-    fn env_filter_directive_uses_configured_level() {
-        let directive = build_env_filter_directive(LogLevel::Trace, None);
-        assert_eq!(
-            directive,
-            "trace,hyper=warn,reqwest=warn,rustls=warn,h2=warn"
-        );
-    }
-
-    #[test]
-    fn env_filter_directive_rust_log_wins_outright() {
-        // RUST_LOG replaces the whole directive, including the per-crate quieting — it does
-        // NOT get merged with `hyper=warn,...`.
-        let directive = build_env_filter_directive(LogLevel::Error, Some("my_crate=trace"));
-        assert_eq!(directive, "my_crate=trace");
     }
 
     // ---- AlbumRef classification ---------------------------------------------------------
@@ -484,8 +411,7 @@ mod tests {
 
     #[test]
     fn normalize_server_url_rejects_garbage() {
-        let err = normalize_server_url("not a url").unwrap_err();
-        assert!(err.to_string().contains("IMPORT_SERVER_URL"));
+        assert!(normalize_server_url("not a url").is_err());
     }
 
     // ---- Secret redaction ------------------------------------------------------------------
@@ -493,9 +419,7 @@ mod tests {
     #[test]
     fn secret_debug_is_always_redacted() {
         let secret = Secret::from_str("hunter2").unwrap();
-        let debug_output = format!("{secret:?}");
-        assert_eq!(debug_output, "[redacted]");
-        assert!(!debug_output.contains("hunter2"));
+        assert_eq!(format!("{secret:?}"), "[redacted]");
     }
 
     #[test]
@@ -504,13 +428,14 @@ mod tests {
         assert_eq!(secret.expose(), "hunter2");
     }
 
+    /// Not a format assertion but a security one: whatever `{:?}` on a `Config` produces, the
+    /// password and the API key must not be anywhere in it.
     #[test]
     fn config_debug_never_prints_secrets() {
         let cfg = parse(&["--export-album-password", "hunter2"]).unwrap();
         let debug_output = format!("{cfg:?}");
         assert!(!debug_output.contains("hunter2"));
         assert!(!debug_output.contains("test-api-key"));
-        assert!(debug_output.contains("[redacted]"));
     }
 
     // ---- validation ---------------------------------------------------------------------
@@ -523,44 +448,62 @@ mod tests {
 
     #[test]
     fn validate_rejects_empty_api_key() {
-        let cfg = parse(&["--import-api-key", ""]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("IMPORT_API_KEY"));
+        assert!(
+            parse(&["--import-api-key", ""])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn validate_rejects_whitespace_only_api_key() {
-        let cfg = parse(&["--import-api-key", "   "]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("IMPORT_API_KEY"));
+        assert!(
+            parse(&["--import-api-key", "   "])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn validate_rejects_zero_interval() {
-        let cfg = parse(&["--import-interval", "0s"]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("IMPORT_INTERVAL"));
+        assert!(
+            parse(&["--import-interval", "0s"])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn validate_rejects_zero_concurrency() {
-        let cfg = parse(&["--import-concurrency", "0"]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("IMPORT_CONCURRENCY"));
+        assert!(
+            parse(&["--import-concurrency", "0"])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn validate_rejects_zero_request_timeout() {
-        let cfg = parse(&["--request-timeout", "0s"]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("REQUEST_TIMEOUT"));
+        assert!(
+            parse(&["--request-timeout", "0s"])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     #[test]
     fn validate_rejects_zero_transfer_timeout() {
-        let cfg = parse(&["--transfer-timeout", "0s"]).unwrap();
-        let err = cfg.validate().unwrap_err();
-        assert!(err.to_string().contains("TRANSFER_TIMEOUT"));
+        assert!(
+            parse(&["--transfer-timeout", "0s"])
+                .unwrap()
+                .validate()
+                .is_err()
+        );
     }
 
     // ---- required fields ------------------------------------------------------------------

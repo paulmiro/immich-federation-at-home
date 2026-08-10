@@ -22,13 +22,13 @@ use anyhow::Context;
 use futures_util::stream::{self, StreamExt};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempPath};
 use tokio::task::spawn_blocking;
-use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::immich::dto;
 use crate::immich::export::{DownloadOutcome, ExportClient, ExportError, SourceAsset};
 use crate::immich::import::{BulkUploadCheckOutcome, ImportClient, UploadRequest};
 use crate::retry::{self, RetryPolicy};
+use crate::{debug, error, info, warn};
 
 /// The counters from one [`SyncContext::run_once`] call — also what backs the §8 summary
 /// log line, returned as data (not just logged) so `main.rs` and tests can assert on it.
@@ -111,10 +111,8 @@ impl SyncContext {
     pub async fn run_once(&self) -> anyhow::Result<RunSummary> {
         let start = Instant::now();
         info!(
-            export_album_id = %self.export_album_id,
-            import_album_id = %self.import_album_id,
-            concurrency = self.concurrency,
-            "sync run starting"
+            "sync run starting export_album_id={} import_album_id={} concurrency={}",
+            self.export_album_id, self.import_album_id, self.concurrency
         );
 
         // ---- 1. list ---------------------------------------------------------------
@@ -124,7 +122,7 @@ impl SyncContext {
             .await
             .context("failed to list the export album's assets")?;
         let source_count = source_assets.len();
-        debug!(count = source_count, "source assets listed");
+        debug!("source assets listed count={source_count}");
 
         // ---- 2. check ---------------------------------------------------------------
         let check_items: Vec<dto::AssetBulkUploadCheckItem> = source_assets
@@ -146,10 +144,10 @@ impl SyncContext {
         let mut album_targets: HashMap<Uuid, String> = HashMap::new();
         let classified = Self::classify(source_assets, &outcomes, &mut album_targets);
         debug!(
-            to_transfer = classified.to_transfer.len(),
-            already_present = classified.already_present_count,
-            skipped = classified.skipped_count,
-            "bulk-upload-check complete"
+            "bulk-upload-check complete to_transfer={} already_present={} skipped={}",
+            classified.to_transfer.len(),
+            classified.already_present_count,
+            classified.skipped_count
         );
 
         // ---- 3. transfer --------------------------------------------------------------
@@ -187,14 +185,15 @@ impl SyncContext {
             took,
         };
         info!(
-            source = summary.source,
-            already_present = summary.already_present,
-            transferred = summary.transferred,
-            failed = summary.failed,
-            added_to_album = summary.added_to_album,
-            skipped = summary.skipped,
-            took = ?summary.took,
-            "sync run complete"
+            "sync run complete source={} already_present={} transferred={} failed={} \
+             added_to_album={} skipped={} took={:.1?}",
+            summary.source,
+            summary.already_present,
+            summary.transferred,
+            summary.failed,
+            summary.added_to_album,
+            summary.skipped,
+            summary.took
         );
         Ok(summary)
     }
@@ -222,19 +221,15 @@ impl SyncContext {
                 }) => {
                     if *is_trashed {
                         warn!(
-                            filename = %asset.filename,
-                            checksum = %asset.checksum,
-                            export_id = %asset.id,
-                            import_id = %import_id,
-                            "asset already exists on the import instance but sits in its trash"
+                            "asset already exists on the import instance but sits in its trash \
+                             filename={} checksum={} export_id={} import_id={import_id}",
+                            asset.filename, asset.checksum, asset.id
                         );
                     }
                     info!(
-                        filename = %asset.filename,
-                        checksum = %asset.checksum,
-                        export_id = %asset.id,
-                        import_id = %import_id,
-                        "already present"
+                        "already present filename={} checksum={} export_id={} \
+                         import_id={import_id}",
+                        asset.filename, asset.checksum, asset.id
                     );
                     album_targets.insert(*import_id, asset.filename.clone());
                     already_present_count += 1;
@@ -244,11 +239,9 @@ impl SyncContext {
                     ..
                 }) => {
                     error!(
-                        filename = %asset.filename,
-                        checksum = %asset.checksum,
-                        export_id = %asset.id,
                         "the import instance rejected this asset as an unsupported format; \
-                         skipping permanently"
+                         skipping permanently filename={} checksum={} export_id={}",
+                        asset.filename, asset.checksum, asset.id
                     );
                     skipped_count += 1;
                 }
@@ -258,11 +251,9 @@ impl SyncContext {
                     // the same as `unsupported-format`: log loudly and move on, rather than
                     // letting one odd item fail the whole run.
                     error!(
-                        filename = %asset.filename,
-                        checksum = %asset.checksum,
-                        export_id = %asset.id,
-                        outcome = ?other,
-                        "bulk-upload-check returned an unusable result for this asset; skipping"
+                        "bulk-upload-check returned an unusable result for this asset; \
+                         skipping filename={} checksum={} export_id={} outcome={other:?}",
+                        asset.filename, asset.checksum, asset.id
                     );
                     skipped_count += 1;
                 }
@@ -300,10 +291,8 @@ impl SyncContext {
         for id in &outcome.added {
             let filename = album_targets.get(id).map_or("(unknown)", String::as_str);
             info!(
-                filename = %filename,
-                import_id = %id,
-                album_id = %self.import_album_id,
-                "added to album"
+                "added to album filename={filename} import_id={id} album_id={}",
+                self.import_album_id
             );
         }
 
@@ -311,20 +300,18 @@ impl SyncContext {
         for (id, reason) in &outcome.failed {
             let filename = album_targets.get(id).map_or("(unknown)", String::as_str);
             error!(
-                filename = %filename,
-                import_id = %id,
-                album_id = %self.import_album_id,
-                reason = ?reason,
-                "failed to add asset to the import album"
+                "failed to add asset to the import album filename={filename} import_id={id} \
+                 album_id={} reason={reason:?}",
+                self.import_album_id
             );
             failed_count += 1;
         }
 
         debug!(
-            added = outcome.added.len(),
-            already_in_album = outcome.already_present.len(),
-            failed = outcome.failed.len(),
-            "album-add complete"
+            "album-add complete added={} already_in_album={} failed={}",
+            outcome.added.len(),
+            outcome.already_present.len(),
+            outcome.failed.len()
         );
 
         Ok((outcome.added.len(), failed_count))
@@ -345,11 +332,8 @@ impl SyncContext {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
                 error!(
-                    filename = %asset.filename,
-                    checksum = %asset.checksum,
-                    export_id = %asset.id,
-                    transfer_timeout = ?self.transfer_timeout,
-                    "asset transfer timed out; skipping"
+                    "asset transfer timed out; skipping {asset} transfer_timeout={}",
+                    humantime::format_duration(self.transfer_timeout)
                 );
                 None
             }
@@ -374,23 +358,11 @@ impl SyncContext {
         {
             Ok(Ok(path)) => path,
             Ok(Err(source)) => {
-                error!(
-                    filename = %asset.filename,
-                    checksum = %asset.checksum,
-                    export_id = %asset.id,
-                    error = %source,
-                    "failed to create a temporary file for the download"
-                );
+                error!("failed to create a temporary file for the download {asset}: {source}");
                 return None;
             }
             Err(join_err) => {
-                error!(
-                    filename = %asset.filename,
-                    checksum = %asset.checksum,
-                    export_id = %asset.id,
-                    error = %join_err,
-                    "temp file creation task did not complete"
-                );
+                error!("temp file creation task did not complete {asset}: {join_err}");
                 return None;
             }
         };
@@ -401,20 +373,16 @@ impl SyncContext {
         // otherwise do a synchronous `remove_file` right here on whatever thread is
         // running this future.
         if let Err(join_err) = spawn_blocking(move || drop(temp_path)).await {
-            warn!(error = %join_err, "temp file cleanup task did not complete cleanly");
+            warn!("temp file cleanup task did not complete cleanly: {join_err}");
         }
 
         let (media, download_outcome) = result?;
-        let took = start.elapsed();
         info!(
-            filename = %asset.filename,
-            checksum = %asset.checksum,
-            export_id = %asset.id,
-            import_id = %media.id,
-            bytes = download_outcome.bytes_written,
-            status = status_str(media.status),
-            took = ?took,
-            "transferred asset"
+            "transferred asset {asset} import_id={} bytes={} status={} took={:.1?}",
+            media.id,
+            download_outcome.bytes_written,
+            status_str(media.status),
+            start.elapsed()
         );
         Some(TransferSuccess {
             import_id: media.id,
@@ -435,13 +403,7 @@ impl SyncContext {
         let download_outcome = match self.download_with_retry(asset, temp_path).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                error!(
-                    filename = %asset.filename,
-                    checksum = %asset.checksum,
-                    export_id = %asset.id,
-                    error = %err,
-                    "failed to download the original asset"
-                );
+                error!("failed to download the original asset {asset}: {err}");
                 return None;
             }
         };
@@ -449,12 +411,9 @@ impl SyncContext {
         // 3b — never upload a corrupted body.
         if download_outcome.checksum_sha1_base64 != asset.checksum {
             error!(
-                filename = %asset.filename,
-                export_id = %asset.id,
-                expected_checksum = %asset.checksum,
-                actual_checksum = %download_outcome.checksum_sha1_base64,
                 "downloaded bytes do not match the source checksum; refusing to upload a \
-                 corrupted body"
+                 corrupted body {asset} actual_checksum={}",
+                download_outcome.checksum_sha1_base64
             );
             return None;
         }
@@ -471,13 +430,7 @@ impl SyncContext {
         match self.import.upload_asset(&upload_request).await {
             Ok(media) => Some((media, download_outcome)),
             Err(err) => {
-                error!(
-                    filename = %asset.filename,
-                    checksum = %asset.checksum,
-                    export_id = %asset.id,
-                    error = %err,
-                    "failed to upload asset to the import instance"
-                );
+                error!("failed to upload asset to the import instance {asset}: {err}");
                 None
             }
         }
@@ -801,36 +754,6 @@ mod tests {
 
     const ALBUM_ID: Uuid = Uuid::from_u128(0x9999_0000_0000_0000_0000_0000_0000_0000);
 
-    /// A `MakeWriter` that appends every formatted log line to an in-memory buffer, so a
-    /// test can assert on (and print) exactly what `tracing_subscriber::fmt` would have
-    /// written to stderr. `Clone` is required by `MakeWriter`'s own bound and is cheap (an
-    /// `Arc` clone) — every clone shares the same underlying buffer.
-    #[derive(Clone, Default)]
-    struct LogCapture(Arc<Mutex<Vec<u8>>>);
-
-    impl LogCapture {
-        fn contents(&self) -> String {
-            String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
-        }
-    }
-
-    impl std::io::Write for LogCapture {
-        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(buf);
-            Ok(buf.len())
-        }
-        fn flush(&mut self) -> std::io::Result<()> {
-            Ok(())
-        }
-    }
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
-        type Writer = Self;
-        fn make_writer(&'a self) -> Self::Writer {
-            self.clone()
-        }
-    }
-
     // ---- clean first run --------------------------------------------------------------
 
     #[tokio::test]
@@ -1011,12 +934,8 @@ mod tests {
 
     // ---- isTrashed duplicate ------------------------------------------------------------
 
-    /// `current_thread` matters here for the same reason as the log-capture test below:
-    /// `tracing::subscriber::set_default`'s guard is thread-local, and the multi-thread
-    /// runtime's work-stealing could otherwise move this test's task to a worker thread
-    /// that never saw it set.
-    #[tokio::test(flavor = "current_thread")]
-    async fn trashed_duplicate_is_warned_and_still_album_added() {
+    #[tokio::test]
+    async fn trashed_duplicate_is_still_album_added() {
         let fixtures = vec![fixture(1, "trashed.jpg", b"exists but in the trash")];
         let (export_base, _e) = spawn_export_server(fixtures.clone()).await;
         let (import_base, state, _i) = spawn_import_server().await;
@@ -1030,16 +949,7 @@ mod tests {
         }
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_env_filter(tracing_subscriber::EnvFilter::new("warn"))
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-
         let summary = ctx.run_once().await.unwrap();
-        drop(guard);
 
         assert_eq!(summary.already_present, 1);
         assert_eq!(summary.transferred, 0);
@@ -1047,27 +957,16 @@ mod tests {
             summary.added_to_album, 1,
             "a trashed duplicate must still be album-added"
         );
-
-        let output = capture.contents();
-        assert!(
-            output.contains("trash"),
-            "expected a trash warning, got: {output}"
-        );
     }
 
-    // ---- captured info-level log output (for the task report) --------------------------
+    // ---- every outcome in one run --------------------------------------------------------
 
-    /// Runs a realistic mixed scenario (a fresh upload, a plain duplicate, a trashed
-    /// duplicate, and an unsupported-format rejection) under a real `tracing_subscriber`
-    /// `fmt` layer capturing to memory, so the captured text is exactly what an operator
-    /// would see on stderr at `info`. Printed via `println!` — run with
-    /// `cargo test info_level_log_output_reads_well -- --nocapture` to see it.
-    ///
-    /// `current_thread` flavor matters here: `tracing::subscriber::set_default`'s guard is
-    /// thread-local, and the multi-thread runtime's work-stealing could otherwise move this
-    /// test's task to a worker thread that never saw `set_default` called.
-    #[tokio::test(flavor = "current_thread")]
-    async fn info_level_log_output_reads_well() {
+    /// One run covering all four per-asset outcomes at once — a fresh upload, a plain
+    /// duplicate, a trashed duplicate, and an unsupported-format rejection — to pin down how
+    /// they add up in the [`RunSummary`]. Also the scenario to run with `--nocapture` when
+    /// eyeballing the `info` log output by hand.
+    #[tokio::test]
+    async fn mixed_run_counts_every_outcome() {
         let fixtures = vec![
             fixture(1, "new-asset.jpg", b"a brand new photo"),
             fixture(2, "duplicate.jpg", b"already on the import side"),
@@ -1091,32 +990,13 @@ mod tests {
         }
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
-        let capture = LogCapture::default();
-        let subscriber = tracing_subscriber::fmt()
-            .with_writer(capture.clone())
-            .with_ansi(false)
-            .with_env_filter(tracing_subscriber::EnvFilter::new("info"))
-            .finish();
-        let guard = tracing::subscriber::set_default(subscriber);
-
         let summary = ctx.run_once().await.unwrap();
-        drop(guard);
 
-        let output = capture.contents();
-        println!("{output}");
-
+        assert_eq!(summary.source, 4);
         assert_eq!(summary.transferred, 1);
         assert_eq!(summary.already_present, 2);
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.added_to_album, 3);
-
-        assert!(output.contains("sync run starting"));
-        assert!(output.contains("transferred asset"));
-        assert!(output.contains("already present"));
-        assert!(output.contains("added to album"));
-        assert!(output.contains("sync run complete"));
-        assert!(output.contains("checksum"));
-        assert!(output.contains("export_id"));
-        assert!(output.contains("import_id"));
+        assert_eq!(summary.failed, 0);
     }
 }

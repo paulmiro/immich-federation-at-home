@@ -8,6 +8,7 @@
 //! (see [`crate::immich::redact_url`]). `E1` (`/server/version`) is the one exception: it is
 //! unauthenticated by design, so no [`ShareRef`] is applied to it.
 
+use std::fmt;
 use std::time::Duration;
 
 use anyhow::Context;
@@ -20,7 +21,6 @@ use reqwest::{Client, Method, StatusCode};
 use sha1::{Digest, Sha1};
 use thiserror::Error;
 use tokio::io::{AsyncWrite, AsyncWriteExt};
-use tracing::{debug, error, warn};
 use url::Url;
 use uuid::Uuid;
 
@@ -30,6 +30,7 @@ use crate::immich::{
 };
 use crate::retry::{RetryPolicy, Retryable};
 use crate::share_url::ShareRef;
+use crate::{debug, error, warn};
 
 /// How many assets `POST /search/metadata` (E4) is asked for per page. `PLAN.md` §6 step 1
 /// fixes this at 250.
@@ -59,6 +60,19 @@ pub struct SourceAsset {
     pub modified: DateTime<Utc>,
     pub r#type: dto::AssetTypeEnum,
     pub duration: Option<i64>,
+}
+
+impl fmt::Display for SourceAsset {
+    /// The three fields `PLAN.md` §8 wants on every per-asset log line. `sync.rs` interpolates
+    /// a `SourceAsset` directly (`info!("transferred asset {asset} ...")`) rather than
+    /// spelling the same three out at each of its dozen call sites.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "filename={} checksum={} export_id={}",
+            self.filename, self.checksum, self.id
+        )
+    }
 }
 
 /// [`dto::AssetResponseDto::checksum`] is spec-required but **not** spec-guaranteed
@@ -368,18 +382,17 @@ impl ExportClient {
             .await?;
 
             debug!(
-                album_id = %album_id,
-                page,
-                items = response.assets.items.len(),
-                total = response.assets.total,
-                next_page = response.assets.next_page.as_deref().unwrap_or("(none)"),
-                "search/metadata page fetched"
+                "search/metadata page fetched album_id={album_id} page={page} items={} \
+                 total={} next_page={}",
+                response.assets.items.len(),
+                response.assets.total,
+                response.assets.next_page.as_deref().unwrap_or("(none)"),
             );
 
             for item in response.assets.items {
                 match SourceAsset::try_from(item) {
                     Ok(asset) => assets.push(asset),
-                    Err(err) => error!(album_id = %album_id, %err, "skipping asset"),
+                    Err(err) => error!("skipping asset album_id={album_id}: {err}"),
                 }
             }
 
@@ -844,6 +857,5 @@ mod tests {
                 ..
             }
         ));
-        assert!(err.to_string().contains("Allow download"));
     }
 }

@@ -14,7 +14,7 @@ use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use tracing::warn;
+use crate::warn;
 
 /// Whether — and how — an error should be retried. Implemented by [`crate::immich::ApiError`]
 /// (transport errors, HTTP status, a sanitised `Retry-After`); anything satisfying this
@@ -136,12 +136,10 @@ where
                     jittered(policy.delay_before_attempt((attempt - 1) as usize))
                 });
                 warn!(
-                    attempt,
-                    max_attempts = policy.max_attempts,
-                    operation = op_name,
-                    cause = %err,
-                    delay_ms = millis_u64(delay),
-                    "retrying after failure"
+                    "retrying after failure operation={op_name} attempt={attempt}/{} \
+                     delay_ms={} cause={err}",
+                    policy.max_attempts,
+                    millis_u64(delay),
                 );
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
