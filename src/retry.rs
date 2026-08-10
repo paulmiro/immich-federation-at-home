@@ -10,11 +10,10 @@
 //! `immich::mod`'s `send_json` wrapper imports `retry` — both directions are fine within
 //! one crate, but keeping `retry.rs` generic is simply better factoring.
 
-use std::fmt;
 use std::future::Future;
 use std::time::Duration;
 
-use crate::warn;
+use crate::{format_error_chain_dyn, warn};
 
 /// Whether — and how — an error should be retried. Implemented by [`crate::immich::ApiError`]
 /// (transport errors, HTTP status, a sanitised `Retry-After`); anything satisfying this
@@ -117,12 +116,16 @@ fn millis_u64(d: Duration) -> u64 {
 /// the request inside the closure each time it's invoked.
 ///
 /// Every retry logs at `warn` with the attempt number, `op_name`, and the cause
-/// (`PLAN.md` §7). On exhaustion, returns the last error unchanged.
+/// (`PLAN.md` §7) — the **full** cause chain (`format_error_chain_dyn`), not just `E`'s own
+/// `Display`, since every `thiserror` error type in this crate describes only its own
+/// layer and leaves the rest to `source()`. That's why the bound here is
+/// `std::error::Error` rather than just `fmt::Display` — this function needs `source()`,
+/// not only a top-line message. On exhaustion, returns the last error unchanged.
 pub async fn retry<T, E, F, Fut>(policy: &RetryPolicy, op_name: &str, mut op: F) -> Result<T, E>
 where
     F: FnMut() -> Fut,
     Fut: Future<Output = Result<T, E>>,
-    E: Retryable + fmt::Display,
+    E: Retryable + std::error::Error + 'static,
 {
     let mut attempt: u32 = 1;
     loop {
@@ -137,9 +140,10 @@ where
                 });
                 warn!(
                     "retrying after failure operation={op_name} attempt={attempt}/{} \
-                     delay_ms={} cause={err}",
+                     delay_ms={} cause={}",
                     policy.max_attempts,
                     millis_u64(delay),
+                    format_error_chain_dyn(&err),
                 );
                 if !delay.is_zero() {
                     tokio::time::sleep(delay).await;
@@ -153,6 +157,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fmt;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     #[derive(Debug)]
@@ -166,6 +171,8 @@ mod tests {
             f.write_str(self.message)
         }
     }
+
+    impl std::error::Error for TestError {}
 
     impl Retryable for TestError {
         fn is_retryable(&self) -> bool {

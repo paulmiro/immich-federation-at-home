@@ -65,7 +65,7 @@ pub enum ImportError {
     /// was already cleaned up, a permissions issue, …), not anything the import server did.
     /// Deliberately **not** retryable (see [`Retryable`] below): retrying an open that just
     /// failed against the same path can't succeed differently.
-    #[error("failed to open {path} for upload: {source}")]
+    #[error("failed to open {path} for upload")]
     Io {
         path: PathBuf,
         #[source]

@@ -24,6 +24,7 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempPath};
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
+use crate::format_error_chain_dyn;
 use crate::immich::dto;
 use crate::immich::export::{DownloadOutcome, ExportClient, ExportError, SourceAsset};
 use crate::immich::import::{BulkUploadCheckOutcome, ImportClient, UploadRequest};
@@ -403,7 +404,10 @@ impl SyncContext {
         let download_outcome = match self.download_with_retry(asset, temp_path).await {
             Ok(outcome) => outcome,
             Err(err) => {
-                error!("failed to download the original asset {asset}: {err}");
+                error!(
+                    "failed to download the original asset {asset}: {}",
+                    format_error_chain_dyn(&err)
+                );
                 return None;
             }
         };
@@ -430,7 +434,10 @@ impl SyncContext {
         match self.import.upload_asset(&upload_request).await {
             Ok(media) => Some((media, download_outcome)),
             Err(err) => {
-                error!("failed to upload asset to the import instance {asset}: {err}");
+                error!(
+                    "failed to upload asset to the import instance {asset}: {}",
+                    format_error_chain_dyn(&err)
+                );
                 None
             }
         }

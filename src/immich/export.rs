@@ -150,8 +150,8 @@ pub enum ExportError {
     /// `NOTES.md`). `401`/`403` are included in the match anyway since nothing in the spec
     /// promises a future server version won't tighten this to a "proper" auth status.
     #[error(
-        "download of asset {asset_id} failed ({status}): {source}. This most likely means \
-         the share link does not have \"Allow download\" enabled."
+        "download of asset {asset_id} failed ({status}). This most likely means the share \
+         link does not have \"Allow download\" enabled."
     )]
     DownloadForbidden {
         asset_id: Uuid,
@@ -162,7 +162,7 @@ pub enum ExportError {
 
     /// Writing the streamed bytes to the caller-supplied writer failed — a local disk
     /// problem (out of space, a bad `TMPDIR`, …), not anything the export server did.
-    #[error("failed to write downloaded asset {asset_id} to disk: {source}")]
+    #[error("failed to write downloaded asset {asset_id} to disk")]
     Io {
         asset_id: Uuid,
         #[source]
@@ -392,7 +392,10 @@ impl ExportClient {
             for item in response.assets.items {
                 match SourceAsset::try_from(item) {
                     Ok(asset) => assets.push(asset),
-                    Err(err) => error!("skipping asset album_id={album_id}: {err}"),
+                    Err(err) => error!(
+                        "skipping asset album_id={album_id}: {}",
+                        crate::format_error_chain_dyn(&err)
+                    ),
                 }
             }
 

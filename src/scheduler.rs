@@ -137,7 +137,7 @@ where
         }
 
         info!(
-            "run complete; sleeping until the next one interval={}",
+            "sleeping until the next run interval={}",
             humantime::format_duration(interval)
         );
         tokio::select! {

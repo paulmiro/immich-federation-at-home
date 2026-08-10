@@ -156,7 +156,7 @@ fn redact_json_body(bytes: &[u8]) -> String {
 pub enum ApiError {
     /// The request never got a response at all: DNS/connect failure, timeout, TLS error,
     /// or (rarely) a request-builder error (e.g. an invalid header value).
-    #[error("{method} {url} failed: {source}")]
+    #[error("{method} {url} failed")]
     Transport {
         method: Method,
         url: String,
@@ -180,7 +180,7 @@ pub enum ApiError {
 
     /// A 2xx response whose body didn't deserialize as the type the caller asked for — a
     /// real bug (our DTO vs. the server's actual shape), never worth retrying.
-    #[error("{method} {url} -> {status}: failed to decode JSON response body: {source}")]
+    #[error("{method} {url} -> {status}: failed to decode JSON response body")]
     Decode {
         method: Method,
         url: String,

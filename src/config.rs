@@ -75,9 +75,8 @@ fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
 /// All configuration is environment variables (the flags below are equivalent — a flag wins
 /// over its environment variable if both are given). Repeated runs are idempotent and the
 /// tool keeps no state of its own: `TMPDIR` (or the platform's default temp directory) is
-/// used by the `tempfile` crate directly to stage each asset's bytes transiently while it is
-/// in flight; there is no dedicated field for it here because nothing in this program's own
-/// code reads it.
+/// used to stage each asset's bytes transiently while it is in flight, and nothing is kept
+/// afterwards.
 #[derive(Parser, Debug)]
 #[command(name = "immich-federation-at-home", version)]
 pub struct Config {
