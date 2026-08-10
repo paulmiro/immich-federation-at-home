@@ -37,11 +37,17 @@ services:
     ports:
       - '2283:2283'
     depends_on:
-      - export-redis
-      - export-database
+      # `condition: service_healthy` matters: with a plain list, compose only waits for the
+      # dependency to *start*, so the server races postgres, dies with ECONNREFUSED on
+      # 5432, and only recovers because something restarts it. Both stacks did exactly that
+      # on the first real run of this suite.
+      export-redis:
+        condition: service_healthy
+      export-database:
+        condition: service_healthy
     networks:
       - export-net
-    restart: unless-stopped
+    restart: 'no'
     healthcheck:
       disable: false
 
@@ -52,7 +58,7 @@ services:
       - export-net
     healthcheck:
       test: redis-cli ping || exit 1
-    restart: unless-stopped
+    restart: 'no'
 
   export-database:
     container_name: immich-e2e-export-database
@@ -67,7 +73,7 @@ services:
     shm_size: 128mb
     networks:
       - export-net
-    restart: unless-stopped
+    restart: 'no'
     healthcheck:
       disable: false
 
@@ -85,11 +91,17 @@ services:
     ports:
       - '2284:2283'
     depends_on:
-      - import-redis
-      - import-database
+      # `condition: service_healthy` matters: with a plain list, compose only waits for the
+      # dependency to *start*, so the server races postgres, dies with ECONNREFUSED on
+      # 5432, and only recovers because something restarts it. Both stacks did exactly that
+      # on the first real run of this suite.
+      import-redis:
+        condition: service_healthy
+      import-database:
+        condition: service_healthy
     networks:
       - import-net
-    restart: unless-stopped
+    restart: 'no'
     healthcheck:
       disable: false
 
@@ -100,7 +112,7 @@ services:
       - import-net
     healthcheck:
       test: redis-cli ping || exit 1
-    restart: unless-stopped
+    restart: 'no'
 
   import-database:
     container_name: immich-e2e-import-database
@@ -115,7 +127,7 @@ services:
     shm_size: 128mb
     networks:
       - import-net
-    restart: unless-stopped
+    restart: 'no'
     healthcheck:
       disable: false
 

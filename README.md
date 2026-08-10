@@ -270,12 +270,18 @@ Everything below is verified to work in this repo as of this README:
   OpenAPI spec at `openapi/immich-openapi-3.1.0.json` from
   `https://docs.immich.app/openapi.json`, and leaves the file untouched (reporting "no
   change") if nothing changed.
-* **`tests/e2e/`** exists — a real two-instance Docker Compose end-to-end test — but per
-  its own header comment it has been **written and never executed**, not even once, not
-  even manually. It compiles, lints, and is correctly `#[ignore]`d so it never runs as
-  part of `cargo test` or `nix flake check`; running it for real (`cargo test --test e2e
-  -- --ignored`, with `tests/e2e/compose.yaml` up) is unverified territory. Treat it as a
-  best-effort transcription of the API, not proven-correct code.
+* **`tests/e2e/`** — a real two-instance end-to-end test against two `immich-server:v3.1.0`
+  stacks. It is `#[ignore]`d so it never runs as part of `cargo test` or `nix flake check`,
+  since it needs Docker. Run it for real with:
+
+  ```sh
+  docker compose -f tests/e2e/compose.yaml up -d --wait
+  cargo test --test e2e -- --ignored --nocapture
+  docker compose -f tests/e2e/compose.yaml down -v
+  ```
+
+  It signs up an admin on each instance, so it needs *fresh* stacks — always `down -v`
+  between runs. Bringing both stacks up takes about a minute.
 
 There is no `tracing`/`log`-facade dependency in this crate at all: logging is a
 hand-written ~40-line module (`src/log.rs`) with one atomic level threshold. `RUST_LOG`

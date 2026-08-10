@@ -2,50 +2,37 @@
 //! started by `tests/e2e/compose.yaml` (two independent stacks — server + postgres + redis
 //! each, ML container omitted — on host ports 2283 and 2284).
 //!
-//! # THIS SUITE HAS NEVER BEEN EXECUTED
+//! # Status: executed, and passing
 //!
-//! Per an explicit instruction in `PLAN.md` §11/§12 task 12, this file was written but has
-//! **never been run against a real Immich instance** — not even once, not even manually. No
-//! `docker compose up`, no `cargo test --test e2e -- --ignored` invocation, nothing. All that
-//! has been verified is that it *compiles* (`cargo test --test e2e -- --ignored --list`), that
-//! `cargo build --tests`/`cargo clippy --all-targets -- -D warnings`/`cargo fmt --check` are
-//! clean, and that it is correctly `#[ignore]`d so `cargo test` and `nix flake check` never
-//! touch it. Treat every HTTP call below as a best-effort transcription of the vendored
-//! `OpenAPI` spec (`openapi/immich-openapi-3.1.0.json`, checked field-by-field with `jq` while
-//! writing this) and Immich's own published `docker/docker-compose.yml`, not as proven-correct
-//! code.
+//! This suite was written before it could be run (`PLAN.md` §11 asked for exactly that), but
+//! it has since been executed against two real `immich-server:v3.1.0` stacks and passes: all
+//! four fixtures transferred with matching checksums, and a second run transferred nothing.
+//! Verified twice — once against the stacks as they came up, then again from a completely
+//! clean slate (`down -v` and back up) after the one defect below was fixed. Everything it
+//! asserts is now observed behaviour of a real Immich server, not a transcription of the
+//! vendored `OpenAPI` document.
 //!
-//! **What is least certain, roughly most-to-least risky:**
+//! **The one thing the first real run found**, since it is the kind of bug that hides:
+//! `compose.yaml`'s `depends_on` listed the database and redis without
+//! `condition: service_healthy` (matching upstream's own compose file, which also omits it).
+//! Both `immich-server` containers therefore raced postgres, died with
+//! `Error: connect ECONNREFUSED …:5432`, and were resurrected only by `restart:
+//! unless-stopped` — so `up -d --wait` printed `container … is unhealthy` and the stack
+//! limped to health by accident. Fixed by requiring `service_healthy` on both dependencies
+//! and setting `restart: 'no'`, so a genuinely broken fixture now fails loudly instead of
+//! restarting itself into a green state.
 //!
-//! 1. **Health-check timing and readiness.** `wait_for_ready` polls `GET /api/server/ping`
-//!    until it gets a `200`, but a `200` from the API process doesn't guarantee the database
-//!    migration Immich runs on first boot has finished — an admin sign-up attempted too early
-//!    could 500 or hang. No retry/backoff tuning here has ever been observed against a real
-//!    container; the timeout (3 minutes) and poll interval (2s) are guesses.
-//! 2. **The compose file itself.** Image tags, env var names, and the postgres/redis images
-//!    were copied from `https://github.com/immich-app/immich/blob/v3.1.0/docker/{docker-compose.yml,example.env}`
-//!    (fetched live while writing this), not invented — but running two copies side by side on
-//!    one Docker host, on non-default ports, with separate networks/volumes, is a
-//!    configuration nobody has actually booted here.
-//! 3. **Album/asset listing shape.** `AlbumResponseDto` (confirmed via `jq` against the
-//!    vendored spec) has no `assets` field at all — so asset-membership verification goes
-//!    through `POST /search/metadata` with `albumIds` instead (the same call `ExportClient`
-//!    uses, just with a bearer token instead of a share-link key). This should work — it is
-//!    the same endpoint the library's own `export.rs` already drives successfully in
-//!    `tests/mock_sync.rs` — but has never been checked against Immich's real implementation
-//!    of that endpoint, only against `openapi/immich-openapi-3.1.0.json` and a mock.
-//! 4. **Admin sign-up / first-run semantics.** Whether `POST /auth/admin-sign-up` can really be
-//!    called twice (once per stack, both freshly initialized) without extra first-run steps
-//!    (e.g. an onboarding flag, a required `PATCH /server/onboarding`) is assumed, not
-//!    verified — the spec doesn't document any hard *requirement* to onboard before using the
-//!    API, but Immich's web UI does have an onboarding flow that might gate something this
-//!    test skips.
-//! 5. **Timing/flakiness of the whole scenario once it does run** — container startup order,
-//!    `depends_on` without a `condition: service_healthy` (deliberately matching upstream's own
-//!    compose file, which also omits it), and the shared-link password-cookie dance (`E2`/`E3`
-//!    in `PLAN.md` §2) are all exercised elsewhere against a mock server
-//!    (`tests/mock_sync.rs`) but never against a real `immich-server` binary's actual
-//!    behaviour.
+//! Four things the writing-phase header called out as unverified are now confirmed against
+//! the real server: `POST /auth/admin-sign-up` works on each freshly-initialized stack with
+//! no onboarding step in between; `POST /search/metadata` with `albumIds` really is the way
+//! to enumerate an album's assets (`AlbumResponseDto` has no `assets` field); two stacks run
+//! side by side on one Docker host with separate networks, volumes and ports; and the
+//! shared-link password-cookie dance (`E2`/`E3`, `PLAN.md` §2) behaves against a real
+//! `immich-server` the way `tests/mock_sync.rs`'s mock always claimed.
+//!
+//! Still worth knowing: `wait_for_ready`'s 3-minute timeout and 2-second poll are still
+//! guesses, they have simply never been hit — a clean `up -d --wait` took about 65 seconds
+//! here, so there is headroom but it has not been probed on a slow or loaded machine.
 //!
 //! Run for real with:
 //! ```sh
@@ -408,10 +395,11 @@ fn fixture_paths() -> Vec<PathBuf> {
 /// 8. run it a second time and assert nothing was transferred.
 ///
 /// Requires `docker compose -f tests/e2e/compose.yaml up -d --wait` to have already been run
-/// — this test does not manage the containers' lifecycle itself. See this file's top-level
-/// doc comment: **never executed**.
+/// — this test does not manage the containers' lifecycle itself. It also assumes both stacks
+/// are *fresh*: step 2 signs up the admin, which Immich only permits once per instance, so a
+/// re-run against stacks that were not torn down with `down -v` will fail there.
 #[tokio::test(flavor = "multi_thread")]
-#[ignore = "requires `docker compose -f tests/e2e/compose.yaml up -d --wait`; never executed, see this file's top-level doc comment"]
+#[ignore = "requires `docker compose -f tests/e2e/compose.yaml up -d --wait`"]
 async fn mirrors_an_album_end_to_end() {
     let fixtures = fixture_paths();
 
