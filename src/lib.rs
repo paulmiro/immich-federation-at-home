@@ -13,3 +13,4 @@ pub mod config;
 pub mod immich;
 pub mod retry;
 pub mod share_url;
+pub mod sync;

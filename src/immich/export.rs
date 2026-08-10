@@ -28,7 +28,7 @@ use crate::config::Secret;
 use crate::immich::{
     self, ApiError, Version, build_client, dto, execute_once, parse_json_response, send_json,
 };
-use crate::retry::RetryPolicy;
+use crate::retry::{RetryPolicy, Retryable};
 use crate::share_url::ShareRef;
 
 /// How many assets `POST /search/metadata` (E4) is asked for per page. `PLAN.md` §6 step 1
@@ -173,6 +173,29 @@ pub enum ExportError {
          aborting rather than looping forever"
     )]
     TooManyPages { album_id: Uuid },
+}
+
+/// Lets [`ExportError`] be driven through [`crate::retry::retry`] directly. Added for
+/// `sync.rs` (task 8): [`ExportClient::download_original`] (E5) is deliberately **not**
+/// retried internally (see its doc comment — it cannot safely retry without corrupting a
+/// partially-written output), which pushes the retry loop to the caller. That caller wants
+/// to drive the retry through the same generic [`crate::retry::retry`] helper everything
+/// else uses (rather than hand-rolling a second backoff/jitter implementation), which
+/// requires `E: Retryable` — mirrors [`crate::immich::import::ImportError`]'s identical
+/// impl exactly: defers to the wrapped [`ApiError`]'s own classification, `false` for every
+/// other variant (a stalled/looping pagination or a local disk error can't succeed
+/// differently on an identical retry).
+impl Retryable for ExportError {
+    fn is_retryable(&self) -> bool {
+        matches!(self, ExportError::Api(err) if err.is_retryable())
+    }
+
+    fn retry_after(&self) -> Option<std::time::Duration> {
+        match self {
+            ExportError::Api(err) => err.retry_after(),
+            _ => None,
+        }
+    }
 }
 
 /// The result of [`ExportClient::login`] (E2). A `400` from that endpoint means "this link
