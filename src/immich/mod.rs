@@ -9,6 +9,8 @@
 //! [`execute_once`] directly so the body never has to be buffered in memory.
 
 pub mod dto;
+pub mod export;
+pub mod import;
 
 use std::fmt;
 use std::time::{Duration, Instant};
@@ -29,17 +31,30 @@ pub const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PK
 /// tool's name/version as the `User-Agent`. `timeout` is a parameter (rather than a single
 /// hard-coded constant) because the export and import clients need different values —
 /// `REQUEST_TIMEOUT` for metadata calls, `TRANSFER_TIMEOUT` for the download+upload of one
-/// asset (`PLAN.md` §4) — and likely different `Client`s entirely for that reason.
+/// asset (`PLAN.md` §4) — and different `Client`s entirely for that reason: both
+/// `export::ExportClient` and `import::ImportClient` build one of each.
 ///
 /// `cookie_store` should be `true` only for the export client: the shared-link password
 /// login (`PLAN.md` §5 step 5, E2) sets an `immich_shared_link_token` cookie that every
 /// subsequent export-side request must carry. The import client (API-key auth) never
 /// needs one. TLS is always `rustls` — the only backend compiled in, see `Cargo.toml`.
-pub fn build_client(timeout: Duration, cookie_store: bool) -> reqwest::Result<Client> {
+///
+/// `default_headers` is applied to every request the returned client ever makes. This is
+/// what lets `import::ImportClient` bake its `x-api-key` header in once at construction time
+/// (`PLAN.md` §2: "the API key goes in an `x-api-key` header") rather than every call site
+/// having to remember to attach it — pass `HeaderMap::new()` for a client that needs none
+/// (the export client authenticates via `?key=`/`?slug=` query parameters instead, see
+/// `share_url::ShareRef::apply`).
+pub fn build_client(
+    timeout: Duration,
+    cookie_store: bool,
+    default_headers: HeaderMap,
+) -> reqwest::Result<Client> {
     Client::builder()
         .timeout(timeout)
         .user_agent(USER_AGENT)
         .cookie_store(cookie_store)
+        .default_headers(default_headers)
         .build()
 }
 
@@ -443,8 +458,37 @@ impl From<dto::ServerVersionResponseDto> for Version {
     }
 }
 
+/// Small shared test helper for the export/import client test suites (`export.rs`,
+/// `import.rs`) and this module's own tests below: spins up a real `axum` server on an
+/// OS-assigned loopback port. Kept in one place — `pub(crate)` rather than duplicated three
+/// times — since every HTTP client test in this crate needs the exact same "give me a
+/// running server and its base URL" primitive; nothing here is specific to `send_json`'s own
+/// tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use tokio::task::JoinHandle;
+    use url::Url;
+
+    /// Binds `app` to `127.0.0.1:0` (an OS-assigned free port) and returns its base URL
+    /// (**with** a trailing slash — `Url::join`-friendly for callers that want it, though
+    /// `export.rs`/`import.rs` build their own request URLs by `format!`, per this module's
+    /// own `Url::join` gotcha, and so normalise the trailing slash away themselves) plus the
+    /// `JoinHandle` of the task serving it. Callers just hold the handle for the test's
+    /// duration; dropping it aborts the server, which is fine — tests don't need graceful
+    /// shutdown.
+    pub(crate) async fn spawn_test_server(app: axum::Router) -> (Url, JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (Url::parse(&format!("http://{addr}/")).unwrap(), handle)
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    use super::test_support::spawn_test_server;
     use super::*;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicU32, Ordering};
@@ -770,15 +814,6 @@ mod tests {
 
     // ---- send_json end-to-end (a tiny real HTTP server, not a mock) ---------------------
 
-    async fn spawn_test_server(app: axum::Router) -> (Url, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-        (Url::parse(&format!("http://{addr}/")).unwrap(), handle)
-    }
-
     #[tokio::test]
     async fn send_json_retries_a_500_and_succeeds_on_the_next_attempt() {
         let calls = Arc::new(AtomicU32::new(0));
@@ -807,7 +842,7 @@ mod tests {
         );
         let (base, _server) = spawn_test_server(app).await;
         let url = base.join("version").unwrap();
-        let client = build_client(Duration::from_secs(5), false).unwrap();
+        let client = build_client(Duration::from_secs(5), false, HeaderMap::new()).unwrap();
         let policy = RetryPolicy::zero_delay();
 
         let dto: dto::ServerVersionResponseDto =
@@ -842,7 +877,7 @@ mod tests {
         );
         let (base, _server) = spawn_test_server(app).await;
         let url = base.join("albums/missing").unwrap();
-        let client = build_client(Duration::from_secs(5), false).unwrap();
+        let client = build_client(Duration::from_secs(5), false, HeaderMap::new()).unwrap();
         let policy = RetryPolicy::zero_delay();
 
         let result: Result<dto::AlbumResponseDto, ApiError> =
