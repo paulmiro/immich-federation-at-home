@@ -47,7 +47,7 @@
           };
 
           apps.update-openapi = {
-            meta.description = "Refresh openapi/immich-openapi-3.1.0.json from upstream";
+            meta.description = "Refresh openapi/immich-openapi.json from upstream";
 
             program = pkgs.writeShellApplication {
               name = "update-openapi";

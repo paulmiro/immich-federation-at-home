@@ -1,6 +1,6 @@
 //! Hand-written `serde` types for the Immich API surface used by `PLAN.md` §2 (calls
 //! E1–E5, I1–I6). Every field name, type, and required/nullable-ness below was checked
-//! against `openapi/immich-openapi-3.1.0.json` with `jq` — see the doc comment on each
+//! against `openapi/immich-openapi.json` with `jq` — see the doc comment on each
 //! type for the exact query used and what it returned. Where `PLAN.md`/`scratch/RESEARCH.md`
 //! said something different from the spec, the spec wins; discrepancies are called out
 //! below and recorded in `NOTES.md`.
@@ -456,7 +456,7 @@ impl ApiKeyResponseDto {
 /// '[.. | objects | select(has("statusCode"))] | length'` over the whole document returns
 /// `0`. This shape is `NestJS`'s well-known default `HttpExceptionFilter` output (also
 /// described, consistently, in `PLAN.md`'s I5 request detail), not something verified
-/// against `openapi/immich-openapi-3.1.0.json` — recorded in `NOTES.md` since the task
+/// against `openapi/immich-openapi.json` — recorded in `NOTES.md` since the task
 /// brief for this file otherwise insists everything be checked against the spec.
 ///
 /// `message` is sometimes a bare string, sometimes `string[]` (`NestJS`'s built-in

@@ -400,7 +400,7 @@ Everything below is verified to work in this repo as of this README:
 * **`nix develop`** — a shell with `cargo`/`rustc`/`clippy`/`rustfmt`/`rust-analyzer`/`jq`/
   `curl`/`docker-compose` on `PATH`.
 * **`nix run .#update-openapi`** — refreshes the vendored reference copy of the Immich
-  OpenAPI spec at `openapi/immich-openapi-3.1.0.json` from
+  OpenAPI spec at `openapi/immich-openapi.json` from
   `https://docs.immich.app/openapi.json`, and leaves the file untouched (reporting "no
   change") if nothing changed.
 * **`tests/e2e/`** — a real two-instance end-to-end test against two `immich-server:v3.1.0`

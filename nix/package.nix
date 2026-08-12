@@ -15,7 +15,7 @@
       craneLib = inputs.crane.mkLib pkgs;
 
       # craneLib.cleanCargoSource keeps only Rust/cargo files, which would silently drop
-      # openapi/immich-openapi-3.1.0.json (read at runtime by tests/spec_conformance.rs
+      # openapi/immich-openapi.json (read at runtime by tests/spec_conformance.rs
       # via env!("CARGO_MANIFEST_DIR")) and the e2e fixtures/compose file. Keep them
       # explicitly.
       src = lib.fileset.toSource {

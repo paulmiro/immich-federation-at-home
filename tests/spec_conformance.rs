@@ -1,4 +1,4 @@
-//! `PLAN.md` §11: loads the vendored `openapi/immich-openapi-3.1.0.json` at *runtime* (via
+//! `PLAN.md` §11: loads the vendored `openapi/immich-openapi.json` at *runtime* (via
 //! `std::fs`, resolved from `CARGO_MANIFEST_DIR` — the spec is a dev-time reference, not a
 //! build input, per `PLAN.md` §3/§9) and asserts that:
 //!
@@ -26,7 +26,7 @@ use immich_federation_at_home::immich::dto;
 
 static SPEC: LazyLock<serde_json::Value> = LazyLock::new(|| {
     let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi/immich-openapi-3.1.0.json");
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi/immich-openapi.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read vendored spec at {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("vendored spec must be valid JSON")

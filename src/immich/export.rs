@@ -132,7 +132,7 @@ impl SourceAsset {
     /// Which algorithm produced a given `checksum` is not something the API tells us.
     /// `checksumAlgorithm` exists as a field on the server's asset entity, but it is
     /// deliberately not mapped into `AssetResponseDto` — it does not appear anywhere in
-    /// `openapi/immich-openapi-3.1.0.json`. So there is no discriminator to read; the only
+    /// `openapi/immich-openapi.json`. So there is no discriminator to read; the only
     /// way to tell the two apart is to recompute one of them and compare. That's what this
     /// method does, and it is why the answer it gives is a **positive identification, not
     /// an inference**: `sha1("path:" + originalPath)` either equals `checksum` — in which

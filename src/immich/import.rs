@@ -364,7 +364,7 @@ impl ImportClient {
     /// streamed — never buffered whole into memory — with `filename` and a guessed
     /// `Content-Type`), `filename`, `fileCreatedAt`/`fileModifiedAt` (RFC 3339 with
     /// millisecond precision and a `Z` suffix, matching `AssetMediaCreateDto`'s spec pattern
-    /// exactly — verified with `jq` against `openapi/immich-openapi-3.1.0.json`), and
+    /// exactly — verified with `jq` against `openapi/immich-openapi.json`), and
     /// `duration` (milliseconds, text, only when [`UploadRequest::duration_ms`] is `Some`).
     /// The `x-immich-checksum` header carries `checksum_sha1_base64` — **base64**, not hex:
     /// the spec only documents the header as "sha1 checksum" without naming an encoding, but
