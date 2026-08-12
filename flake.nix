@@ -103,7 +103,7 @@
             # the ownership into the layer without actually needing the privilege.
             fakeRootCommands = ''
               mkdir -p var/cache/immich-federation-at-home
-              chown -R 65534:65534 var/cache/immich-federation-at-home
+              chown -R 65532:65532 var/cache/immich-federation-at-home
             '';
             config = {
               Entrypoint = [ "${self'.packages.default}/bin/immich-federation-at-home" ];
@@ -111,7 +111,7 @@
                 "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
                 "CACHE_DIR=/var/cache/immich-federation-at-home"
               ];
-              User = "65534:65534";
+              User = "65532:65532";
             };
           };
 

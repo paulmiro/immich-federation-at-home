@@ -353,8 +353,8 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
         Some(dir) => ContentHashCache::open(dir).with_context(|| {
             format!(
                 "CACHE_DIR={} could not be created or written. If you are running the \
-                 container image, it runs as uid 65534, so a bind-mounted host directory \
-                 must be owned by that uid (chown 65534:65534 on the host) — a named Docker \
+                 container image, it runs as uid 65532, so a bind-mounted host directory \
+                 must be owned by that uid (chown 65532:65532 on the host) — a named Docker \
                  volume avoids the problem entirely and is what the README recommends. \
                  Unset CACHE_DIR to run without a cache instead.",
                 dir.display()

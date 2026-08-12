@@ -82,10 +82,10 @@ services:
       # Optional, but strongly recommended if the source album has assets from an Immich
       # external library (see "How deduplication works" below) — without it, such an asset
       # is re-downloaded from scratch every run instead of once. A *named* volume, not a
-      # bind mount: the image already creates CACHE_DIR owned by uid 65534 (the uid the
+      # bind mount: the image already creates CACHE_DIR owned by uid 65532 (the uid the
       # container runs as), and a named volume inherits that ownership automatically. A
       # bind-mounted host directory is root-owned by default and will hit a fatal startup
-      # error until you `chown 65534:65534` it yourself.
+      # error until you `chown 65532:65532` it yourself.
       - cache:/var/cache/immich-federation-at-home
 
 volumes:
@@ -304,7 +304,7 @@ whatever provider is configured (keyring, 1Password, sops, …) — see
   permissions problem, and it's fatal on purpose rather than a surprise later. Fix it one
   of three ways: use a named Docker volume instead of a bind mount (see
   [Docker Compose](#docker-compose) — it inherits the right ownership automatically);
-  `chown 65534:65534` the bind-mounted host directory yourself, since that's the uid the
+  `chown 65532:65532` the bind-mounted host directory yourself, since that's the uid the
   container image runs as; or unset `CACHE_DIR` to run without a cache.
 
 ## Development
