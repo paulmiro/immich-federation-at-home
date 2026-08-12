@@ -285,11 +285,8 @@ mod tests {
 
     #[test]
     fn cache_dir_flag_sets_the_path() {
-        let cfg = parse(&["--cache-dir", "/var/cache/immich-federation-at-home"]).unwrap();
-        assert_eq!(
-            cfg.cache_dir,
-            Some(PathBuf::from("/var/cache/immich-federation-at-home"))
-        );
+        let cfg = parse(&["--cache-dir", "/cache"]).unwrap();
+        assert_eq!(cfg.cache_dir, Some(PathBuf::from("/cache")));
     }
 
     // ---- --once / RUN_ONCE flag --------------------------------------------------------

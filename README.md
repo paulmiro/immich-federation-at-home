@@ -89,7 +89,7 @@ services:
       # 65532, the uid the container runs as, and a named volume inherits that ownership
       # automatically. A bind-mounted host directory is root-owned by default and will hit
       # a fatal startup error until you `chown 65532:65532` it yourself.
-      - cache:/var/cache/immich-federation-at-home
+      - cache:/cache
 
 volumes:
   cache:
@@ -164,7 +164,7 @@ binary with `--help` to see the same information generated live from the same st
 | `TRANSFER_TIMEOUT`      | no       | `30m`   | Timeout for downloading and re-uploading a single asset.                                          |
 | `RUN_ONCE`              | no       | `false` | Do one sync pass and exit instead of looping with `IMPORT_INTERVAL` between runs. Also settable via `--once`. Only `true`/`false` are accepted from the environment — not `1`/`0`. |
 | `TMPDIR`                | no       | system  | Where assets are staged during transfer (read by the `tempfile` crate directly, not by this program's own code — see the Docker Compose `tmpfs` note above for sizing). |
-| `CACHE_DIR`             | no       | unset, but **the container image sets it** to `/var/cache/immich-federation-at-home` | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). With no value at all — which in practice means running the binary directly, not the image — the cache is disabled entirely; nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. Setting it to the empty string does **not** disable it: an empty environment variable is still a value, and the program then fails to create a directory with no name. |
+| `CACHE_DIR`             | no       | unset, but **the container image sets it** to `/cache` | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). With no value at all — which in practice means running the binary directly, not the image — the cache is disabled entirely; nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. Setting it to the empty string does **not** disable it: an empty environment variable is still a value, and the program then fails to create a directory with no name. |
 
 Every flag has an equivalent `--kebab-case-flag`; a flag wins over its environment
 variable if both are set (`--help` shows the full mapping).
