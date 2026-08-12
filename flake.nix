@@ -91,9 +91,26 @@
               mkdir -p tmp
               chmod 1777 tmp
             '';
+            # The content-hash cache lives here. It has to be owned by the same uid the
+            # image runs as, so that a *named* Docker volume mounted over it inherits that
+            # ownership and just works; a bind mount does not, and the program says so
+            # explicitly when it cannot write here. Without a volume this is the container's
+            # writable layer, which is still useful — the cache survives for the life of the
+            # container, just not across a re-create.
+            #
+            # This is `fakeRootCommands` rather than `extraCommands` because `chown` to
+            # another uid is not permitted in the Nix build sandbox; fakeroot is what records
+            # the ownership into the layer without actually needing the privilege.
+            fakeRootCommands = ''
+              mkdir -p var/cache/immich-federation-at-home
+              chown -R 65534:65534 var/cache/immich-federation-at-home
+            '';
             config = {
               Entrypoint = [ "${self'.packages.default}/bin/immich-federation-at-home" ];
-              Env = [ "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt" ];
+              Env = [
+                "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
+                "CACHE_DIR=/var/cache/immich-federation-at-home"
+              ];
               User = "65534:65534";
             };
           };
