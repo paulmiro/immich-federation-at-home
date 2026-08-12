@@ -7,6 +7,7 @@
 //! 1 (non-empty API key, non-zero interval/timeouts/concurrency).
 
 use std::fmt;
+use std::path::PathBuf;
 use std::str::FromStr;
 use std::time::Duration;
 
@@ -131,6 +132,14 @@ pub struct Config {
     /// runs. Also settable as `RUN_ONCE=true` / `RUN_ONCE=false`.
     #[arg(long = "once", env = "RUN_ONCE", action = clap::ArgAction::SetTrue)]
     pub run_once: bool,
+
+    /// Directory for the content-hash cache, which lets a re-run recognise an unchanged
+    /// external-library asset without re-downloading it. Strongly recommended; it only
+    /// matters when the export album contains assets from an Immich external library
+    /// (ordinary uploaded assets are unaffected either way). Leave unset to disable the
+    /// cache entirely — every run then re-downloads external-library assets from scratch.
+    #[arg(long, env = "CACHE_DIR")]
+    pub cache_dir: Option<PathBuf>,
 }
 
 impl Config {
@@ -261,6 +270,24 @@ mod tests {
         assert_eq!(cfg.transfer_timeout, Duration::from_secs(30 * 60));
         assert!(!cfg.run_once);
         assert!(cfg.export_album_password.is_none());
+        assert!(cfg.cache_dir.is_none());
+    }
+
+    // ---- CACHE_DIR ------------------------------------------------------------------------
+
+    #[test]
+    fn cache_dir_defaults_to_unset() {
+        let cfg = parse(&[]).unwrap();
+        assert!(cfg.cache_dir.is_none());
+    }
+
+    #[test]
+    fn cache_dir_flag_sets_the_path() {
+        let cfg = parse(&["--cache-dir", "/var/cache/immich-federation-at-home"]).unwrap();
+        assert_eq!(
+            cfg.cache_dir,
+            Some(PathBuf::from("/var/cache/immich-federation-at-home"))
+        );
     }
 
     // ---- --once / RUN_ONCE flag --------------------------------------------------------

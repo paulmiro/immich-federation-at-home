@@ -17,6 +17,7 @@ use anyhow::Context;
 use chrono::{DateTime, Utc};
 use uuid::Uuid;
 
+use crate::cache::ContentHashCache;
 use crate::config::Config;
 use crate::immich::export::{ExportClient, ExportError, LoginOutcome};
 use crate::immich::import::ImportClient;
@@ -203,6 +204,20 @@ pub struct StartupSummary {
     pub target_album_id: Uuid,
     pub interval: std::time::Duration,
     pub concurrency: u32,
+    /// The cache line for the startup summary: `cache=disabled` when `CACHE_DIR` is unset, or
+    /// `cache=<dir> entries=<n>` when it's open and loaded. Rendered once here (rather than
+    /// carrying `dir`/`entry_count` separately into [`StartupSummary`]) so
+    /// [`ContentHashCache`] stays the single source of truth for its own state.
+    pub cache_summary: String,
+}
+
+/// Renders the `cache=…` field [`StartupSummary::log`] appends — its own function since
+/// [`run_startup`] needs the exact same text to build [`StartupSummary`].
+fn cache_summary(cache: &ContentHashCache, dir: Option<&std::path::Path>) -> String {
+    match dir {
+        Some(dir) => format!("cache={} entries={}", dir.display(), cache.entry_count()),
+        None => "cache=disabled".to_owned(),
+    }
 }
 
 impl StartupSummary {
@@ -219,7 +234,7 @@ impl StartupSummary {
             "startup complete export_version={} import_version={} share_link_id={} \
              share_link_type={} share_link_expires_at={expires_at} export_album={:?} \
              export_asset_count={} import_album={:?} import_album_id={} interval={} \
-             concurrency={}",
+             concurrency={} {}",
             self.export_version,
             self.import_version,
             self.share_link_id,
@@ -229,7 +244,8 @@ impl StartupSummary {
             self.target_album_name,
             self.target_album_id,
             humantime::format_duration(self.interval),
-            self.concurrency
+            self.concurrency,
+            self.cache_summary
         );
     }
 }
@@ -329,6 +345,24 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
     // ids) are already exactly the actionable text §5 step 9 asks for — nothing to add.
     let target_album = import.resolve_album(&config.import_album_ref()).await?;
 
+    // The content-hash cache (`scratch/CACHE-DESIGN.md`). Built now, before `SyncContext`,
+    // so a misconfigured `CACHE_DIR` is a loud, immediate startup failure rather than a
+    // warning discovered only once the first run tries to save the cache: this is always
+    // user error (typically a root-owned bind mount) and must be caught here.
+    let cache = match &config.cache_dir {
+        Some(dir) => ContentHashCache::open(dir).with_context(|| {
+            format!(
+                "CACHE_DIR={} could not be created or written. If you are running the \
+                 container image, it runs as uid 65534, so a bind-mounted host directory \
+                 must be owned by that uid (chown 65534:65534 on the host) — a named Docker \
+                 volume avoids the problem entirely and is what the README recommends. \
+                 Unset CACHE_DIR to run without a cache instead.",
+                dir.display()
+            )
+        })?,
+        None => ContentHashCache::disabled(),
+    };
+
     // Step 10 — summary.
     let summary = StartupSummary {
         export_version,
@@ -342,6 +376,7 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
         target_album_id: target_album.id,
         interval: config.import_interval,
         concurrency: config.import_concurrency,
+        cache_summary: cache_summary(&cache, config.cache_dir.as_deref()),
     };
     summary.log();
 
@@ -353,6 +388,7 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
         config.import_concurrency,
         config.transfer_timeout,
         retry_policy,
+        cache,
     );
 
     Ok(StartupOutcome { sync, summary })

@@ -15,7 +15,7 @@
 //!   is logged, counted, and does not stop the run; step 1 or 2 failing aborts the run (an
 //!   `Err` from [`SyncContext::run_once`]) but not the process — the next tick retries.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -24,12 +24,12 @@ use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempPath};
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
-use crate::format_error_chain_dyn;
+use crate::cache::ContentHashCache;
 use crate::immich::dto;
 use crate::immich::export::{DownloadOutcome, ExportClient, ExportError, SourceAsset};
 use crate::immich::import::{BulkUploadCheckOutcome, ImportClient, UploadRequest};
 use crate::retry::{self, RetryPolicy};
-use crate::{debug, error, info, warn};
+use crate::{debug, error, format_error_chain, format_error_chain_dyn, info, warn};
 
 /// The counters from one [`SyncContext::run_once`] call — also what backs the §8 summary
 /// log line, returned as data (not just logged) so `main.rs` and tests can assert on it.
@@ -51,6 +51,13 @@ pub struct RunSummary {
     /// Assets permanently unusable this run: I4 `unsupported-format`, or an unclassifiable
     /// bulk-upload-check result. Never retried by a later tick unless the source changes.
     pub skipped: usize,
+    /// Path-hashed assets (`scratch/CACHE-DESIGN.md`) served entirely from the content-hash
+    /// cache this run — no download, deduplicated via the up-front bulk-upload-check exactly
+    /// like a content-hashed asset. Tracked separately from `already_present`/`transferred`
+    /// so an operator can tell the cache is actually doing something; a cache hit that turned
+    /// out to be a duplicate on the import side is counted in both this and
+    /// `already_present`.
+    pub cache_hits: usize,
     /// Wall-clock time for the whole run.
     pub took: Duration,
 }
@@ -80,9 +87,20 @@ pub struct SyncContext {
     /// writer); this is what lets [`SyncContext::download_with_retry`] retry it safely from
     /// here, opening a clean temp file per attempt.
     download_retry_policy: RetryPolicy,
+    /// The path-hash → content-hash cache (`scratch/CACHE-DESIGN.md`). A plain field, not an
+    /// `Arc`: every [`ContentHashCache`] method takes `&self`, and the transfer futures in
+    /// [`Self::run_once`] only ever borrow `&self` (this whole `SyncContext`), never move out
+    /// of it, so there is nothing an `Arc` would buy here.
+    cache: ContentHashCache,
 }
 
 impl SyncContext {
+    /// 8 constructor arguments rather than a builder or params struct: every field is a
+    /// distinct, already-well-named piece of startup state (see each field's own doc comment
+    /// above) built exactly once (`startup.rs::run_startup`) and once more in this module's
+    /// own tests — there is no repeated or optional-subset call site that a builder would pay
+    /// for itself against.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         export: ExportClient,
         import: ImportClient,
@@ -91,6 +109,7 @@ impl SyncContext {
         concurrency: u32,
         transfer_timeout: Duration,
         download_retry_policy: RetryPolicy,
+        cache: ContentHashCache,
     ) -> Self {
         Self {
             export,
@@ -100,6 +119,7 @@ impl SyncContext {
             concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX).max(1),
             transfer_timeout,
             download_retry_policy,
+            cache,
         }
     }
 
@@ -125,12 +145,18 @@ impl SyncContext {
         let source_count = source_assets.len();
         debug!("source assets listed count={source_count}");
 
-        // ---- 2. check ---------------------------------------------------------------
-        let check_items: Vec<dto::AssetBulkUploadCheckItem> = source_assets
+        // ---- partition into the three cohorts (`scratch/CACHE-DESIGN.md`) --------------
+        let cohorts = self.partition_cohorts(source_assets);
+        let cache_hits = cohorts.cache_hits;
+
+        // ---- 2. check (cohorts 1 and 2 only; the miss cohort is checked per asset in
+        // step 3, after its own download — see `scratch/CACHE-DESIGN.md`) ----------------
+        let check_items: Vec<dto::AssetBulkUploadCheckItem> = cohorts
+            .check_candidates
             .iter()
-            .map(|asset| dto::AssetBulkUploadCheckItem {
-                id: asset.id.to_string(),
-                checksum: asset.checksum.clone(),
+            .map(|candidate| dto::AssetBulkUploadCheckItem {
+                id: candidate.asset.id.to_string(),
+                checksum: candidate.checksum.clone(),
             })
             .collect();
         let outcomes = self
@@ -143,68 +169,171 @@ impl SyncContext {
         // run (pre-existing duplicates and freshly uploaded assets alike) — I6 only ever
         // returns bare UUIDs, but the "added to album" log line (§8) needs a filename too.
         let mut album_targets: HashMap<Uuid, String> = HashMap::new();
-        let classified = Self::classify(source_assets, &outcomes, &mut album_targets);
+        let mut classified =
+            Self::classify(cohorts.check_candidates, &outcomes, &mut album_targets);
+        classified
+            .to_transfer
+            .extend(cohorts.misses.into_iter().map(|asset| PlannedTransfer {
+                asset,
+                expected_checksum: None,
+            }));
         debug!(
-            "bulk-upload-check complete to_transfer={} already_present={} skipped={}",
+            "bulk-upload-check complete to_transfer={} already_present={} skipped={} \
+             cache_hits={cache_hits}",
             classified.to_transfer.len(),
             classified.already_present_count,
             classified.skipped_count
         );
 
         // ---- 3. transfer --------------------------------------------------------------
-        let transfer_results: Vec<Option<TransferSuccess>> = stream::iter(classified.to_transfer)
-            .map(|asset| self.transfer_one(asset))
+        let transfer_results: Vec<TransferOutcome> = stream::iter(classified.to_transfer)
+            .map(|item| self.transfer_one(item))
             .buffer_unordered(self.concurrency)
             .collect()
             .await;
-
-        let mut transferred_count: usize = 0;
-        let mut failed_count: usize = 0;
-        for result in transfer_results {
-            match result {
-                Some(success) => {
-                    album_targets.insert(success.import_id, success.filename);
-                    transferred_count += 1;
-                }
-                None => failed_count += 1,
-            }
-        }
+        let counts = Self::fold_transfer_results(
+            transfer_results,
+            &mut album_targets,
+            classified.already_present_count,
+            classified.skipped_count,
+        );
 
         // ---- 4. album -----------------------------------------------------------------
         let (added_to_album_count, album_failed_count) = self.add_to_album(&album_targets).await?;
-        failed_count += album_failed_count;
+        let failed_count = counts.failed + album_failed_count;
+
+        // ---- persist the content-hash cache --------------------------------------------
+        // Only reached once the album listing (step 1) has succeeded, which is exactly the
+        // condition `scratch/CACHE-DESIGN.md` requires before pruning. A failure here is
+        // logged, not propagated: the run's real work is already done, and the cache is
+        // disposable (losing it only costs a future re-download, never correctness).
+        if let Err(err) = self.cache.persist(&cohorts.path_hash_keep) {
+            error!(
+                "failed to persist the content-hash cache: {}",
+                format_error_chain(&err)
+            );
+        }
 
         // ---- 5. summary -----------------------------------------------------------------
         let took = start.elapsed();
         let summary = RunSummary {
             source: source_count,
-            already_present: classified.already_present_count,
-            transferred: transferred_count,
+            already_present: counts.already_present,
+            transferred: counts.transferred,
             failed: failed_count,
             added_to_album: added_to_album_count,
-            skipped: classified.skipped_count,
+            skipped: counts.skipped,
+            cache_hits,
             took,
         };
         info!(
             "sync run complete source={} already_present={} transferred={} failed={} \
-             added_to_album={} skipped={} took={:.1?}",
+             added_to_album={} skipped={} cache_hits={} took={:.1?}",
             summary.source,
             summary.already_present,
             summary.transferred,
             summary.failed,
             summary.added_to_album,
             summary.skipped,
+            summary.cache_hits,
             summary.took
         );
         Ok(summary)
     }
 
-    /// Step 2 (`PLAN.md` §6): partitions `source_assets` by their I4 outcome, logging every
+    /// Folds step 3's [`TransferOutcome`]s into the running already-present/skipped counts
+    /// step 2 already produced (a cache-miss's own post-download check can add to either),
+    /// inserting every id that needs a step-4 album-add into `album_targets` along the way.
+    fn fold_transfer_results(
+        transfer_results: Vec<TransferOutcome>,
+        album_targets: &mut HashMap<Uuid, String>,
+        already_present_count: usize,
+        skipped_count: usize,
+    ) -> TransferCounts {
+        let mut counts = TransferCounts {
+            already_present: already_present_count,
+            skipped: skipped_count,
+            ..TransferCounts::default()
+        };
+        for outcome in transfer_results {
+            match outcome {
+                TransferOutcome::Transferred {
+                    import_id,
+                    filename,
+                } => {
+                    album_targets.insert(import_id, filename);
+                    counts.transferred += 1;
+                }
+                TransferOutcome::AlreadyPresent {
+                    import_id,
+                    filename,
+                } => {
+                    album_targets.insert(import_id, filename);
+                    counts.already_present += 1;
+                }
+                TransferOutcome::Skipped => counts.skipped += 1,
+                TransferOutcome::Failed => counts.failed += 1,
+            }
+        }
+        counts
+    }
+
+    /// Partitions `source_assets` into the three cohorts `scratch/CACHE-DESIGN.md` describes:
+    /// content-hashed assets and path-hashed cache hits (both destined for the up-front
+    /// `bulk-upload-check` in step 2, as [`CheckCandidate`]s carrying the checksum that check
+    /// should use), and path-hashed cache misses (checked individually in step 3, after their
+    /// own download, since their real content hash isn't known yet).
+    fn partition_cohorts(&self, source_assets: Vec<SourceAsset>) -> Cohorts {
+        let mut path_hash_keep: HashSet<String> = HashSet::new();
+        let mut check_candidates: Vec<CheckCandidate> = Vec::new();
+        let mut misses: Vec<SourceAsset> = Vec::new();
+        let mut cache_hits: usize = 0;
+
+        for asset in source_assets {
+            if !asset.checksum_is_path_hash() {
+                let checksum = asset.checksum.clone();
+                check_candidates.push(CheckCandidate { asset, checksum });
+                continue;
+            }
+
+            path_hash_keep.insert(asset.checksum.clone());
+            if let Some(content_checksum) = self.cache.get(&asset.checksum, asset.modified) {
+                debug!(
+                    "content-hash cache hit filename={} checksum={} export_id={}",
+                    asset.filename, asset.checksum, asset.id
+                );
+                cache_hits += 1;
+                check_candidates.push(CheckCandidate {
+                    asset,
+                    checksum: content_checksum,
+                });
+            } else {
+                debug!(
+                    "content-hash cache miss filename={} checksum={} export_id={}",
+                    asset.filename, asset.checksum, asset.id
+                );
+                misses.push(asset);
+            }
+        }
+
+        Cohorts {
+            check_candidates,
+            misses,
+            path_hash_keep,
+            cache_hits,
+        }
+    }
+
+    /// Step 2 (`PLAN.md` §6): partitions `candidates` by their I4 outcome, logging every
     /// classification (the "already present" §8 line, plus the `isTrashed` warning and the
     /// two error-and-skip cases). Already-present assets are inserted into `album_targets`
-    /// right away, since step 4 needs them regardless of what step 3 does.
+    /// right away, since step 4 needs them regardless of what step 3 does. `candidate.checksum`
+    /// (rather than `candidate.asset.checksum`) is what was actually sent to
+    /// `bulk-upload-check` and what an accepted candidate is expected to hash to after
+    /// download — for a path-hashed cache hit these differ, the latter being the path hash
+    /// (see [`CheckCandidate`]).
     fn classify(
-        source_assets: Vec<SourceAsset>,
+        candidates: Vec<CheckCandidate>,
         outcomes: &HashMap<String, BulkUploadCheckOutcome>,
         album_targets: &mut HashMap<Uuid, String>,
     ) -> ClassifiedAssets {
@@ -212,9 +341,13 @@ impl SyncContext {
         let mut already_present_count: usize = 0;
         let mut skipped_count: usize = 0;
 
-        for asset in source_assets {
+        for candidate in candidates {
+            let CheckCandidate { asset, checksum } = candidate;
             match outcomes.get(asset.id.to_string().as_str()) {
-                Some(BulkUploadCheckOutcome::Accept) => to_transfer.push(asset),
+                Some(BulkUploadCheckOutcome::Accept) => to_transfer.push(PlannedTransfer {
+                    asset,
+                    expected_checksum: Some(checksum),
+                }),
                 Some(BulkUploadCheckOutcome::Reject {
                     reason: Some(dto::AssetRejectReason::Duplicate),
                     asset_id: Some(import_id),
@@ -329,21 +462,22 @@ impl SyncContext {
     /// upload(+retries) could take a multiple of `TRANSFER_TIMEOUT`, not `TRANSFER_TIMEOUT`
     /// itself. Wrapping the whole thing here is what actually enforces the PLAN.md §4
     /// contract ("Timeout for downloading and re-uploading a single asset").
-    async fn transfer_one(&self, asset: SourceAsset) -> Option<TransferSuccess> {
-        match tokio::time::timeout(self.transfer_timeout, self.transfer_one_inner(&asset)).await {
+    async fn transfer_one(&self, item: PlannedTransfer) -> TransferOutcome {
+        match tokio::time::timeout(self.transfer_timeout, self.transfer_one_inner(&item)).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
                 error!(
-                    "asset transfer timed out; skipping {asset} transfer_timeout={}",
+                    "asset transfer timed out; skipping {} transfer_timeout={}",
+                    item.asset,
                     humantime::format_duration(self.transfer_timeout)
                 );
-                None
+                TransferOutcome::Failed
             }
         }
     }
 
-    async fn transfer_one_inner(&self, asset: &SourceAsset) -> Option<TransferSuccess> {
-        let start = Instant::now();
+    async fn transfer_one_inner(&self, item: &PlannedTransfer) -> TransferOutcome {
+        let asset = &item.asset;
 
         // `NamedTempFile`/`Builder::tempfile()` is a blocking API (it calls `mkstemp`
         // under the hood) — run it on the blocking pool rather than an async worker
@@ -361,15 +495,15 @@ impl SyncContext {
             Ok(Ok(path)) => path,
             Ok(Err(source)) => {
                 error!("failed to create a temporary file for the download {asset}: {source}");
-                return None;
+                return TransferOutcome::Failed;
             }
             Err(join_err) => {
                 error!("temp file creation task did not complete {asset}: {join_err}");
-                return None;
+                return TransferOutcome::Failed;
             }
         };
 
-        let result = self.download_and_upload(asset, &temp_path).await;
+        let outcome = self.download_and_upload(item, &temp_path).await;
 
         // Cleanup also goes through the blocking pool: `TempPath`'s own `Drop` impl would
         // otherwise do a synchronous `remove_file` right here on whatever thread is
@@ -378,29 +512,24 @@ impl SyncContext {
             warn!("temp file cleanup task did not complete cleanly: {join_err}");
         }
 
-        let (media, download_outcome) = result?;
-        info!(
-            "transferred asset {asset} import_id={} bytes={} status={} took={:.1?}",
-            media.id,
-            download_outcome.bytes_written,
-            status_str(media.status),
-            start.elapsed()
-        );
-        Some(TransferSuccess {
-            import_id: media.id,
-            filename: asset.filename.clone(),
-        })
+        outcome
     }
 
     /// Steps 3a–3c: download to `temp_path` (with its own retry loop, see
-    /// [`Self::download_with_retry`]), verify the checksum, and upload. Every failure is
-    /// logged here (with the asset's identifying fields) and turned into `None` rather than
-    /// propagated — this is where §6's per-asset failure isolation actually happens.
+    /// [`Self::download_with_retry`]), verify the checksum when one is expected, and upload
+    /// (or, for a path-hashed cache miss with no expected checksum, run the post-download
+    /// single-item `bulk-upload-check` `scratch/CACHE-DESIGN.md` describes before deciding
+    /// whether to upload at all). Every failure is logged here (with the asset's identifying
+    /// fields) and turned into [`TransferOutcome::Failed`] rather than propagated — this is
+    /// where §6's per-asset failure isolation actually happens.
     async fn download_and_upload(
         &self,
-        asset: &SourceAsset,
+        item: &PlannedTransfer,
         temp_path: &TempPath,
-    ) -> Option<(dto::AssetMediaResponseDto, DownloadOutcome)> {
+    ) -> TransferOutcome {
+        let start = Instant::now();
+        let asset = &item.asset;
+
         // 3a
         let download_outcome = match self.download_with_retry(asset, temp_path).await {
             Ok(outcome) => outcome,
@@ -409,21 +538,57 @@ impl SyncContext {
                     "failed to download the original asset {asset}: {}",
                     format_error_chain_dyn(&err)
                 );
-                return None;
+                return TransferOutcome::Failed;
             }
         };
 
-        // 3b — never upload a corrupted body.
-        if download_outcome.checksum_sha1_base64 != asset.checksum {
-            error!(
-                "downloaded bytes do not match the source checksum; refusing to upload a \
-                 corrupted body {asset} actual_checksum={}",
-                download_outcome.checksum_sha1_base64
+        // Every path-hashed asset that gets downloaded — hit or miss alike — teaches the
+        // cache its real content hash, keyed by the path hash we already know. A hit that
+        // reaches here (its cached hash didn't dedupe it against the import instance) just
+        // reconfirms what the cache already had; a miss is what actually populates the
+        // cache. A no-op when the cache is disabled.
+        if asset.checksum_is_path_hash() {
+            self.cache.insert(
+                asset.checksum.clone(),
+                asset.modified,
+                download_outcome.checksum_sha1_base64.clone(),
             );
-            return None;
         }
 
-        // 3c
+        match &item.expected_checksum {
+            // 3b — a known expected checksum (a content-hashed asset, or a path-hashed cache
+            // hit verified against the cached content hash): never upload a corrupted body.
+            Some(expected) => {
+                if download_outcome.checksum_sha1_base64 != *expected {
+                    error!(
+                        "downloaded bytes do not match the source checksum; refusing to \
+                         upload a corrupted body {asset} actual_checksum={}",
+                        download_outcome.checksum_sha1_base64
+                    );
+                    return TransferOutcome::Failed;
+                }
+                self.upload(asset, &download_outcome, temp_path, start)
+                    .await
+            }
+            // No expected checksum: a path-hashed cache miss. Nothing to verify bytes
+            // against (`scratch/CACHE-DESIGN.md` accepts that corruption detection is lost
+            // here), but the real content hash is now known, so run the single-item
+            // bulk-upload-check the up-front step 2 skipped for this asset.
+            None => {
+                self.check_and_upload_miss(asset, &download_outcome, temp_path, start)
+                    .await
+            }
+        }
+    }
+
+    /// 3c: uploads `asset`'s already-downloaded, already-verified bytes.
+    async fn upload(
+        &self,
+        asset: &SourceAsset,
+        download_outcome: &DownloadOutcome,
+        temp_path: &TempPath,
+        start: Instant,
+    ) -> TransferOutcome {
         let upload_request = UploadRequest {
             file_path: temp_path.as_ref(),
             filename: &asset.filename,
@@ -433,13 +598,108 @@ impl SyncContext {
             checksum_sha1_base64: &download_outcome.checksum_sha1_base64,
         };
         match self.import.upload_asset(&upload_request).await {
-            Ok(media) => Some((media, download_outcome)),
+            Ok(media) => {
+                info!(
+                    "transferred asset {asset} import_id={} bytes={} status={} took={:.1?}",
+                    media.id,
+                    download_outcome.bytes_written,
+                    status_str(media.status),
+                    start.elapsed()
+                );
+                TransferOutcome::Transferred {
+                    import_id: media.id,
+                    filename: asset.filename.clone(),
+                }
+            }
             Err(err) => {
                 error!(
                     "failed to upload asset to the import instance {asset}: {}",
                     format_error_chain_dyn(&err)
                 );
-                None
+                TransferOutcome::Failed
+            }
+        }
+    }
+
+    /// The post-download check for a path-hashed cache miss (`scratch/CACHE-DESIGN.md`): a
+    /// single-item `bulk-upload-check` carrying the content hash just learned by downloading,
+    /// interpreted the same way [`Self::classify`] interprets the up-front batched call, but
+    /// kept as its own small match (rather than sharing `classify`'s loop body) since the two
+    /// call sites log different things — `classify` is reporting on an asset that hasn't been
+    /// downloaded yet, this one is reporting on bytes already in hand.
+    async fn check_and_upload_miss(
+        &self,
+        asset: &SourceAsset,
+        download_outcome: &DownloadOutcome,
+        temp_path: &TempPath,
+        start: Instant,
+    ) -> TransferOutcome {
+        let check_item = dto::AssetBulkUploadCheckItem {
+            id: asset.id.to_string(),
+            checksum: download_outcome.checksum_sha1_base64.clone(),
+        };
+        let outcomes = match self
+            .import
+            .check_bulk_upload(std::slice::from_ref(&check_item))
+            .await
+        {
+            Ok(outcomes) => outcomes,
+            Err(err) => {
+                error!(
+                    "failed to check whether the import instance already has this \
+                     freshly-downloaded asset {asset}: {}",
+                    format_error_chain_dyn(&err)
+                );
+                return TransferOutcome::Failed;
+            }
+        };
+
+        match outcomes.get(asset.id.to_string().as_str()) {
+            Some(BulkUploadCheckOutcome::Accept) => {
+                self.upload(asset, download_outcome, temp_path, start).await
+            }
+            Some(BulkUploadCheckOutcome::Reject {
+                reason: Some(dto::AssetRejectReason::Duplicate),
+                asset_id: Some(import_id),
+                is_trashed,
+            }) => {
+                if *is_trashed {
+                    warn!(
+                        "asset already exists on the import instance but sits in its trash \
+                         filename={} checksum={} export_id={} import_id={import_id}",
+                        asset.filename, download_outcome.checksum_sha1_base64, asset.id
+                    );
+                }
+                info!(
+                    "already present after download filename={} checksum={} export_id={} \
+                     import_id={import_id}",
+                    asset.filename, download_outcome.checksum_sha1_base64, asset.id
+                );
+                TransferOutcome::AlreadyPresent {
+                    import_id: *import_id,
+                    filename: asset.filename.clone(),
+                }
+            }
+            Some(BulkUploadCheckOutcome::Reject {
+                reason: Some(dto::AssetRejectReason::UnsupportedFormat),
+                ..
+            }) => {
+                error!(
+                    "the import instance rejected this freshly-downloaded asset as an \
+                     unsupported format; skipping permanently filename={} checksum={} \
+                     export_id={}",
+                    asset.filename, download_outcome.checksum_sha1_base64, asset.id
+                );
+                TransferOutcome::Skipped
+            }
+            other => {
+                error!(
+                    "bulk-upload-check returned an unusable result for this \
+                     freshly-downloaded asset; skipping filename={} checksum={} export_id={} \
+                     outcome={other:?}",
+                    asset.filename, download_outcome.checksum_sha1_base64, asset.id
+                );
+                TransferOutcome::Skipped
             }
         }
     }
@@ -470,18 +730,71 @@ impl SyncContext {
     }
 }
 
-/// What [`SyncContext::transfer_one`] hands back to [`SyncContext::run_once`] on success:
-/// just enough to add the asset to the album and log that addition later (step 4 only ever
-/// gets bare UUIDs back from I6, hence carrying `filename` along here too).
-struct TransferSuccess {
-    import_id: Uuid,
-    filename: String,
+/// One item [`SyncContext::classify`] sent to `bulk-upload-check`: an asset paired with the
+/// content checksum actually used for that check. Equal to `asset.checksum` for a
+/// content-hashed asset; the cached content hash (not `asset.checksum`, the path hash) for a
+/// path-hashed cache hit — see `scratch/CACHE-DESIGN.md`.
+struct CheckCandidate {
+    asset: SourceAsset,
+    checksum: String,
+}
+
+/// [`SyncContext::partition_cohorts`]'s result.
+struct Cohorts {
+    /// Content-hashed assets and path-hashed cache hits — what step 2's up-front
+    /// `bulk-upload-check` covers.
+    check_candidates: Vec<CheckCandidate>,
+    /// Path-hashed cache misses — checked individually in step 3, after their own download.
+    misses: Vec<SourceAsset>,
+    /// Every path-hashed asset's own checksum seen this run, hit or miss alike — what the
+    /// end-of-run cache prune keeps.
+    path_hash_keep: HashSet<String>,
+    /// How many of `check_candidates` were path-hashed cache hits.
+    cache_hits: usize,
+}
+
+/// [`SyncContext::fold_transfer_results`]'s result: the run-wide counters
+/// [`SyncContext::run_once`] needs after step 3, before step 4's album-add failures are added
+/// to `failed`.
+#[derive(Default)]
+struct TransferCounts {
+    transferred: usize,
+    already_present: usize,
+    skipped: usize,
+    failed: usize,
+}
+
+/// One asset step 3 is about to transfer, carrying the checksum step 3b should verify the
+/// downloaded bytes against — `Some` for a content-hashed asset or a path-hashed cache hit,
+/// `None` for a path-hashed cache miss, whose real content hash isn't known until the bytes
+/// have arrived (`scratch/CACHE-DESIGN.md`).
+struct PlannedTransfer {
+    asset: SourceAsset,
+    expected_checksum: Option<String>,
+}
+
+/// What [`SyncContext::transfer_one`] hands back to [`SyncContext::run_once`]. A cache miss
+/// can resolve to any of the four variants (its own post-download check can find it already
+/// present or permanently unsupported), where a content-hashed asset or a cache hit can only
+/// ever end up `Transferred` or `Failed`.
+enum TransferOutcome {
+    /// Freshly uploaded. `import_id`/`filename` are what step 4 needs to add it to the album.
+    Transferred { import_id: Uuid, filename: String },
+    /// The post-download check (path-hashed cache miss only) found the import instance
+    /// already had these bytes — not uploaded, but still added to the album.
+    AlreadyPresent { import_id: Uuid, filename: String },
+    /// The post-download check rejected it permanently (unsupported format), or returned
+    /// something unclassifiable. Never retried by a later tick unless the source changes.
+    Skipped,
+    /// An isolated failure (download, checksum mismatch, upload, or the post-download
+    /// check itself), already logged at the point it happened.
+    Failed,
 }
 
 /// [`SyncContext::classify`]'s result: which assets step 3 needs to transfer, plus the
 /// counters [`SyncContext::run_once`] folds into the final [`RunSummary`].
 struct ClassifiedAssets {
-    to_transfer: Vec<SourceAsset>,
+    to_transfer: Vec<PlannedTransfer>,
     already_present_count: usize,
     skipped_count: usize,
 }
@@ -516,6 +829,7 @@ fn status_str(status: dto::AssetMediaStatus) -> &'static str {
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::{Arc, Mutex};
 
     use axum::Json;
@@ -525,6 +839,7 @@ mod tests {
     use axum::routing::{get, post, put};
     use base64::Engine;
     use base64::engine::general_purpose::STANDARD as BASE64;
+    use chrono::{DateTime, Utc};
     use serde_json::json;
     use sha1::{Digest, Sha1};
     use tokio::task::JoinHandle;
@@ -545,6 +860,13 @@ mod tests {
         filename: String,
         bytes: Vec<u8>,
         checksum: String,
+        /// `Some` for a path-hashed (external-library) asset: `checksum` above is then
+        /// `sha1("path:" + this)`, not a content hash — see [`path_hashed_fixture`]. `None`
+        /// for an ordinary content-hashed asset, `fixture`'s case.
+        original_path: Option<String>,
+        /// `fileModifiedAt`, as an RFC 3339 string. Varied by the cache-staleness test; every
+        /// other fixture uses [`DEFAULT_MODIFIED`].
+        modified: String,
         /// If set, `GET /assets/{id}/original` serves *different* bytes than `checksum`
         /// implies — simulating corruption in transit (step 3b must catch this).
         corrupt: bool,
@@ -552,6 +874,10 @@ mod tests {
         /// failure isolated to this one asset.
         fail: bool,
     }
+
+    /// `fileModifiedAt`/`fileCreatedAt` every fixture uses unless a test overrides it via
+    /// [`ExportFixture::with_modified`].
+    const DEFAULT_MODIFIED: &str = "2026-05-01T12:00:01.000Z";
 
     fn fixture(n: u128, filename: &str, contents: &[u8]) -> ExportFixture {
         let mut hasher = Sha1::new();
@@ -561,8 +887,44 @@ mod tests {
             filename: filename.to_owned(),
             bytes: contents.to_vec(),
             checksum: BASE64.encode(hasher.finalize()),
+            original_path: None,
+            modified: DEFAULT_MODIFIED.to_owned(),
             corrupt: false,
             fail: false,
+        }
+    }
+
+    /// A path-hashed (external-library) fixture: `checksum` is `sha1("path:" + path)`, per
+    /// `SourceAsset::checksum_is_path_hash`'s detection rule — not a hash of `contents` at
+    /// all, which is the whole point of the cache this module exists to test.
+    fn path_hashed_fixture(n: u128, filename: &str, path: &str, contents: &[u8]) -> ExportFixture {
+        let mut hasher = Sha1::new();
+        hasher.update(b"path:");
+        hasher.update(path.as_bytes());
+        ExportFixture {
+            id: Uuid::from_u128(n),
+            filename: filename.to_owned(),
+            bytes: contents.to_vec(),
+            checksum: BASE64.encode(hasher.finalize()),
+            original_path: Some(path.to_owned()),
+            modified: DEFAULT_MODIFIED.to_owned(),
+            corrupt: false,
+            fail: false,
+        }
+    }
+
+    /// The content hash `contents` would actually hash to — what the cache is expected to
+    /// learn for a [`path_hashed_fixture`] once it's downloaded.
+    fn content_checksum(contents: &[u8]) -> String {
+        let mut hasher = Sha1::new();
+        hasher.update(contents);
+        BASE64.encode(hasher.finalize())
+    }
+
+    impl ExportFixture {
+        fn with_modified(mut self, modified: &str) -> Self {
+            self.modified = modified.to_owned();
+            self
         }
     }
 
@@ -573,16 +935,25 @@ mod tests {
             "originalFileName": f.filename,
             "type": "IMAGE",
             "fileCreatedAt": "2026-05-01T12:00:00.000Z",
-            "fileModifiedAt": "2026-05-01T12:00:01.000Z",
+            "fileModifiedAt": f.modified,
             "originalMimeType": "image/jpeg",
-            "duration": null
+            "duration": null,
+            "originalPath": f.original_path,
         })
     }
 
     /// Spawns a fake export server (E4 search + E5 download) serving exactly `fixtures`.
-    async fn spawn_export_server(fixtures: Vec<ExportFixture>) -> (Url, JoinHandle<()>) {
+    /// Also hands back a counter of `GET /assets/{id}/original` calls. Skipping the download
+    /// is the entire point of the content-hash cache, and an upload counter can't prove it:
+    /// a warm-cache run that downloaded and *then* deduplicated would leave the upload count
+    /// untouched while doing exactly the work the cache exists to avoid.
+    async fn spawn_export_server(
+        fixtures: Vec<ExportFixture>,
+    ) -> (Url, Arc<AtomicUsize>, JoinHandle<()>) {
         let fixtures = Arc::new(fixtures);
         let search_fixtures = fixtures.clone();
+        let downloads = Arc::new(AtomicUsize::new(0));
+        let download_counter = downloads.clone();
         let app = Router::new()
             .route(
                 "/search/metadata",
@@ -600,7 +971,9 @@ mod tests {
                 "/assets/{id}/original",
                 get(move |Path(id): Path<String>| {
                     let fixtures = fixtures.clone();
+                    let download_counter = download_counter.clone();
                     async move {
+                        download_counter.fetch_add(1, Ordering::Relaxed);
                         let found = fixtures.iter().find(|f| f.id.to_string() == id).cloned();
                         let Some(f) = found else {
                             return (StatusCode::NOT_FOUND, Vec::new());
@@ -617,7 +990,8 @@ mod tests {
                     }
                 }),
             );
-        spawn_test_server(Router::new().nest("/api", app)).await
+        let (url, handle) = spawn_test_server(Router::new().nest("/api", app)).await;
+        (url, downloads, handle)
     }
 
     /// In-memory state for the fake import server, shared across every request handler and
@@ -764,6 +1138,20 @@ mod tests {
     }
 
     fn context(export_base: &Url, import_base: &Url, import_album_id: Uuid) -> SyncContext {
+        context_with_cache(
+            export_base,
+            import_base,
+            import_album_id,
+            ContentHashCache::disabled(),
+        )
+    }
+
+    fn context_with_cache(
+        export_base: &Url,
+        import_base: &Url,
+        import_album_id: Uuid,
+        cache: ContentHashCache,
+    ) -> SyncContext {
         SyncContext::new(
             export_client(export_base),
             import_client(import_base),
@@ -772,10 +1160,15 @@ mod tests {
             4,
             Duration::from_secs(10),
             RetryPolicy::zero_delay(),
+            cache,
         )
     }
 
     const ALBUM_ID: Uuid = Uuid::from_u128(0x9999_0000_0000_0000_0000_0000_0000_0000);
+
+    fn default_modified() -> DateTime<Utc> {
+        DEFAULT_MODIFIED.parse().unwrap()
+    }
 
     // ---- clean first run --------------------------------------------------------------
 
@@ -786,7 +1179,7 @@ mod tests {
             fixture(2, "b.jpg", b"asset two bytes, a bit longer"),
             fixture(3, "c.jpg", b"asset three"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
         let (import_base, state, _i) = spawn_import_server().await;
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
@@ -815,7 +1208,7 @@ mod tests {
             fixture(1, "a.jpg", b"asset one bytes"),
             fixture(2, "b.jpg", b"asset two bytes, a bit longer"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
         let (import_base, state, _i) = spawn_import_server().await;
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
@@ -846,7 +1239,7 @@ mod tests {
             fixture(2, "new-one.jpg", b"brand new asset one"),
             fixture(3, "new-two.jpg", b"brand new asset two"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures.clone()).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures.clone()).await;
         let (import_base, state, _i) = spawn_import_server().await;
         // Pre-seed the import server: asset 1's checksum already exists there (as if a
         // previous, unrelated upload put it there), but it was never added to this album.
@@ -884,7 +1277,7 @@ mod tests {
             fixture(2, "fine-one.jpg", b"this one downloads cleanly"),
             fixture(3, "fine-two.jpg", b"so does this one"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
         let (import_base, state, _i) = spawn_import_server().await;
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
@@ -912,7 +1305,7 @@ mod tests {
             fixture(1, "weird.bmp", b"an unsupported format"),
             fixture(2, "normal.jpg", b"a perfectly normal jpeg"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures.clone()).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures.clone()).await;
         let (import_base, state, _i) = spawn_import_server().await;
         state
             .lock()
@@ -942,7 +1335,7 @@ mod tests {
             fixture(2, "ok-one.jpg", b"downloads just fine one"),
             fixture(3, "ok-two.jpg", b"downloads just fine two"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
         let (import_base, state, _i) = spawn_import_server().await;
         let ctx = context(&export_base, &import_base, ALBUM_ID);
 
@@ -960,7 +1353,7 @@ mod tests {
     #[tokio::test]
     async fn trashed_duplicate_is_still_album_added() {
         let fixtures = vec![fixture(1, "trashed.jpg", b"exists but in the trash")];
-        let (export_base, _e) = spawn_export_server(fixtures.clone()).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures.clone()).await;
         let (import_base, state, _i) = spawn_import_server().await;
         let existing_id = Uuid::from_u128(0xC000_0000_0000_0000_0000_0000_0000_0001);
         {
@@ -996,7 +1389,7 @@ mod tests {
             fixture(3, "trashed-dupe.jpg", b"already there but trashed"),
             fixture(4, "unsupported.bmp", b"not a supported format"),
         ];
-        let (export_base, _e) = spawn_export_server(fixtures.clone()).await;
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures.clone()).await;
         let (import_base, state, _i) = spawn_import_server().await;
         {
             let mut state = state.lock().unwrap();
@@ -1021,5 +1414,186 @@ mod tests {
         assert_eq!(summary.skipped, 1);
         assert_eq!(summary.added_to_album, 3);
         assert_eq!(summary.failed, 0);
+    }
+
+    // ---- the content-hash cache (`scratch/CACHE-DESIGN.md`) --------------------------------
+
+    /// A cold cache: the path-hashed asset must be downloaded, pass its post-download
+    /// single-item check (accepted), get uploaded, and have its real content hash land in the
+    /// cache — on disk, not just in memory, since [`ContentHashCache::persist`] runs inside
+    /// `run_once` itself.
+    #[tokio::test]
+    async fn path_hashed_cold_cache_downloads_checks_uploads_and_populates_cache() {
+        let path = "/library/photo.jpg";
+        let contents = b"external library bytes";
+        let fx = path_hashed_fixture(1, "photo.jpg", path, contents);
+        let (export_base, _downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.source, 1);
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(summary.cache_hits, 0);
+        assert_eq!(summary.already_present, 0);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.added_to_album, 1);
+        assert_eq!(state.lock().unwrap().upload_calls, 1);
+
+        // The content hash the download actually produced (not the path-hash `checksum` the
+        // fixture advertises) must be what got cached.
+        let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(&fx.checksum, default_modified()),
+            Some(content_checksum(contents))
+        );
+    }
+
+    /// The same asset, second run, warm cache: the up-front bulk-upload-check alone
+    /// deduplicates it (the cache substitutes the real content hash into that check), so no
+    /// download and no second upload ever happen.
+    #[tokio::test]
+    async fn path_hashed_warm_cache_second_run_dedupes_with_no_download() {
+        let path = "/library/photo.jpg";
+        let contents = b"external library bytes, round two";
+        let fx = path_hashed_fixture(1, "photo.jpg", path, contents);
+        let (export_base, downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let first = ctx.run_once().await.unwrap();
+        assert_eq!(first.transferred, 1);
+        assert_eq!(first.cache_hits, 0);
+        assert_eq!(
+            downloads.load(Ordering::Relaxed),
+            1,
+            "the cold run downloads"
+        );
+
+        let second = ctx.run_once().await.unwrap();
+        assert_eq!(second.source, 1);
+        assert_eq!(second.transferred, 0);
+        assert_eq!(second.cache_hits, 1);
+        assert_eq!(second.already_present, 1);
+        assert_eq!(
+            second.added_to_album, 0,
+            "already a member from the first run"
+        );
+        assert_eq!(second.failed, 0);
+
+        // Only one upload ever happened, across both runs — and, the point of the whole
+        // exercise, only one download: the warm run never touched the export instance's
+        // bytes at all.
+        assert_eq!(state.lock().unwrap().upload_calls, 1);
+        assert_eq!(downloads.load(Ordering::Relaxed), 1);
+    }
+
+    /// A path-hashed cache miss whose post-download check finds the import instance already
+    /// has these bytes: not uploaded, counted as `already_present`, still added to the album,
+    /// and still learned into the cache (the content hash is known regardless of what the
+    /// import side already has).
+    #[tokio::test]
+    async fn path_hashed_miss_duplicate_after_download_is_not_uploaded() {
+        let path = "/library/photo.jpg";
+        let contents = b"bytes the import side already has";
+        let fx = path_hashed_fixture(1, "photo.jpg", path, contents);
+        let (export_base, _downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let existing_id = Uuid::from_u128(0xE000_0000_0000_0000_0000_0000_0000_0001);
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .by_checksum
+                .insert(content_checksum(contents), existing_id);
+        }
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.source, 1);
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(summary.added_to_album, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            state.lock().unwrap().upload_calls,
+            0,
+            "a post-download duplicate must never be uploaded"
+        );
+
+        let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
+        assert_eq!(
+            reopened.get(&fx.checksum, default_modified()),
+            Some(content_checksum(contents)),
+            "the content hash must be learned even though the asset wasn't uploaded"
+        );
+    }
+
+    /// A cache entry whose `modified` no longer matches the source asset's current
+    /// `fileModifiedAt` is a miss, not a stale hit: the asset is re-downloaded.
+    #[tokio::test]
+    async fn path_hashed_stale_modified_timestamp_is_a_miss() {
+        let path = "/library/photo.jpg";
+        let contents = b"the file changed since we last looked";
+        let new_modified = "2026-06-01T09:00:00.000Z";
+        let fx = path_hashed_fixture(1, "photo.jpg", path, contents).with_modified(new_modified);
+        let (export_base, _downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        // The cache already has an entry for this path hash, but at the *old* modified
+        // timestamp — stale now that the fixture's fileModifiedAt has moved on.
+        cache.insert(
+            fx.checksum.clone(),
+            default_modified(),
+            content_checksum(b"the old content, before it changed"),
+        );
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.source, 1);
+        assert_eq!(
+            summary.transferred, 1,
+            "a stale entry must be treated as a miss"
+        );
+        assert_eq!(summary.cache_hits, 0);
+        assert_eq!(state.lock().unwrap().upload_calls, 1);
+
+        let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
+        let new_modified_parsed: DateTime<Utc> = new_modified.parse().unwrap();
+        assert_eq!(
+            reopened.get(&fx.checksum, new_modified_parsed),
+            Some(content_checksum(contents)),
+            "the cache must be updated with the fresh content hash and timestamp"
+        );
+    }
+
+    /// A content-hashed asset (no `originalPath`) behaves exactly as before the cache existed:
+    /// the cache never enters the picture, and a genuine checksum mismatch on download is
+    /// still refused rather than uploaded.
+    #[tokio::test]
+    async fn content_hashed_asset_checksum_mismatch_still_refused_with_cache_enabled() {
+        let mut corrupt = fixture(1, "corrupt.jpg", b"looks fine on paper");
+        corrupt.corrupt = true;
+        let (export_base, _downloads, _e) = spawn_export_server(vec![corrupt]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.failed, 1);
+        assert_eq!(summary.cache_hits, 0);
+        assert_eq!(state.lock().unwrap().upload_calls, 0);
     }
 }

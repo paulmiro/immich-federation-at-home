@@ -34,6 +34,7 @@ use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
 
+use immich_federation_at_home::cache::ContentHashCache;
 use immich_federation_at_home::config::{Config, Secret};
 use immich_federation_at_home::immich::dto;
 use immich_federation_at_home::immich::export::{ExportClient, ExportError};
@@ -275,6 +276,7 @@ impl MockServer {
             4,
             Duration::from_secs(10),
             RetryPolicy::zero_delay(),
+            ContentHashCache::disabled(),
         )
     }
 }
