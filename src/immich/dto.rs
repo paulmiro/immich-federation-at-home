@@ -143,9 +143,9 @@ pub enum AssetTypeEnum {
 /// The subset of `AssetResponseDto` §6 step 1 needs. `jq
 /// '.components.schemas.AssetResponseDto'` → `required` includes `checksum`, `duration`
 /// (nullable — see below), `fileCreatedAt`, `fileModifiedAt`, `id`, `originalFileName`,
-/// `type`, among many fields we don't model. **`originalMimeType` is *not* in the
-/// `required` list** — `PLAN.md`'s bullet list implies it's always there, but the spec
-/// disagrees, so it's `Option<String>` here (recorded in `NOTES.md`).
+/// `originalPath`, `type`, among many fields we don't model. **`originalMimeType` is *not*
+/// in the `required` list** — `PLAN.md`'s bullet list implies it's always there, but the
+/// spec disagrees, so it's `Option<String>` here (recorded in `NOTES.md`).
 ///
 /// `checksum` *is* spec-required and non-nullable (a plain `String`, not `Option`), which
 /// is stronger than `PLAN.md`'s framing ("checksum being absent is a real failure mode we
@@ -159,6 +159,23 @@ pub enum AssetTypeEnum {
 ///
 /// `duration` is required **and** nullable (`integer` or `null`, key always present,
 /// "Video/gif duration in milliseconds \[or\] null for static images") — `Option<i64>`.
+///
+/// `originalPath` — `jq '.components.schemas.AssetResponseDto.required'` lists it, and
+/// `jq '.components.schemas.AssetResponseDto.properties.originalPath'` is
+/// `{"description": "Original file path", "type": "string"}` with no `"nullable": true`,
+/// i.e. it is spec-required **and** non-nullable, the same strong guarantee `checksum`
+/// gets. It is still modelled as `Option<String>` with `#[serde(default)]` here anyway,
+/// deliberately weaker than the spec — because the cost of being wrong is asymmetric. If a
+/// future server version ever stops sending this field for some response shape we haven't
+/// seen yet (a shared-link projection, say), a plain `String` field would fail
+/// deserialization of the *entire page* that asset appears on, taking down every other
+/// asset on that page along with it — assets that have nothing to do with path-hash
+/// detection. `#[serde(default)]` makes a missing key deserialize to `None` instead of an
+/// error. `None` is then treated as "assume content-hashed" (see
+/// [`crate::immich::export::SourceAsset::checksum_is_path_hash`]) — today's behaviour, and
+/// the safe fallback: it can only cause a path-hashed asset to be misclassified as
+/// content-hashed (which just means step 3b's checksum verification does nothing useful
+/// for that one asset, as it already does today), never the reverse.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AssetResponseDto {
@@ -174,6 +191,10 @@ pub struct AssetResponseDto {
     /// Milliseconds; `None` for static images. Required-but-nullable — see the struct doc
     /// comment.
     pub duration: Option<i64>,
+    /// Spec-required and non-nullable, modelled as `Option` anyway for forward
+    /// compatibility — see the struct doc comment.
+    #[serde(default)]
+    pub original_path: Option<String>,
 }
 
 /// `SearchResponseDto` — the top-level `POST /search/metadata` response. `jq
@@ -588,6 +609,43 @@ mod tests {
         assert_eq!(asset.original_mime_type, None);
         assert_eq!(asset.duration, Some(15230));
         assert_eq!(asset.r#type, AssetTypeEnum::Video);
+    }
+
+    #[test]
+    fn asset_response_original_path_present_is_some() {
+        let json = r#"{
+            "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "checksum": "abc=",
+            "originalFileName": "video.mp4",
+            "originalPath": "/data/library/video.mp4",
+            "type": "VIDEO",
+            "fileCreatedAt": "2026-05-01T12:00:00.000Z",
+            "fileModifiedAt": "2026-05-01T12:00:01.000Z",
+            "duration": null
+        }"#;
+        let asset: AssetResponseDto = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            asset.original_path.as_deref(),
+            Some("/data/library/video.mp4")
+        );
+    }
+
+    #[test]
+    fn asset_response_missing_original_path_is_none_not_an_error() {
+        // originalPath IS spec-required, but dto.rs deliberately weakens this to Option —
+        // see the struct doc comment. A response that omits it entirely must still
+        // deserialize the rest of the page rather than erroring out.
+        let json = r#"{
+            "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "checksum": "abc=",
+            "originalFileName": "video.mp4",
+            "type": "VIDEO",
+            "fileCreatedAt": "2026-05-01T12:00:00.000Z",
+            "fileModifiedAt": "2026-05-01T12:00:01.000Z",
+            "duration": null
+        }"#;
+        let asset: AssetResponseDto = serde_json::from_str(json).unwrap();
+        assert_eq!(asset.original_path, None);
     }
 
     #[test]

@@ -12,6 +12,7 @@
 //! plumbing + DTOs, the retry helper, the per-run sync algorithm, the startup sequence, and
 //! the scheduler.
 
+pub mod cache;
 pub mod config;
 pub mod immich;
 pub mod log;

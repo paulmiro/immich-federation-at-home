@@ -60,6 +60,11 @@ pub struct SourceAsset {
     pub modified: DateTime<Utc>,
     pub r#type: dto::AssetTypeEnum,
     pub duration: Option<i64>,
+    /// `dto::AssetResponseDto::original_path`, carried through unchanged. `None` either
+    /// because the server omitted it (see that field's doc comment) or, in principle,
+    /// because it really is empty — either way [`Self::checksum_is_path_hash`] treats
+    /// `None` as "assume content-hashed", the safe fallback.
+    pub original_path: Option<String>,
 }
 
 impl fmt::Display for SourceAsset {
@@ -107,7 +112,50 @@ impl TryFrom<dto::AssetResponseDto> for SourceAsset {
             modified: asset.file_modified_at,
             r#type: asset.r#type,
             duration: asset.duration,
+            original_path: asset.original_path,
         })
+    }
+}
+
+impl SourceAsset {
+    /// Whether `self.checksum` is one of Immich's **path hashes** rather than a content
+    /// hash of the file's bytes.
+    ///
+    /// Immich has two checksum algorithms for an asset (`server/src/enum.ts`, v3.1.0):
+    /// `sha1File` (sha1 of the whole file's contents — what everything in this program has
+    /// assumed so far) and `sha1Path` (sha1 of the literal string `"path:"` concatenated
+    /// with `originalPath` — the server never opens the file). External-library scans use
+    /// the latter: `library.service.ts:421` builds it as `hashSha1(path:${assetPath})`,
+    /// and that's the only value ever stored for such an asset — there is no second,
+    /// content-based hash sitting alongside it to fall back on.
+    ///
+    /// Which algorithm produced a given `checksum` is not something the API tells us.
+    /// `checksumAlgorithm` exists as a field on the server's asset entity, but it is
+    /// deliberately not mapped into `AssetResponseDto` — it does not appear anywhere in
+    /// `openapi/immich-openapi-3.1.0.json`. So there is no discriminator to read; the only
+    /// way to tell the two apart is to recompute one of them and compare. That's what this
+    /// method does, and it is why the answer it gives is a **positive identification, not
+    /// an inference**: `sha1("path:" + originalPath)` either equals `checksum` — in which
+    /// case, short of an astronomically unlikely SHA-1 collision, this asset's checksum
+    /// really is its path hash — or it doesn't, in which case it is presumptively a content
+    /// hash (the safe default; see [`dto::AssetResponseDto::original_path`]'s doc comment
+    /// for why `None` also falls here). There is no ambiguous middle case.
+    ///
+    /// Deliberately **not** based on `libraryId`. An asset belonging to an external library
+    /// is not the same thing as an asset whose checksum is a path hash: the motion-photo
+    /// video that Immich extracts from a Pixel-style `.MP`/`.MV` still image inherits that
+    /// image's `libraryId` (`metadata.service.ts`) but is content-hashed with an explicit
+    /// `sha1File` call on the extracted video bytes, not a path hash — the extracted asset
+    /// has no meaningful "path" of its own to hash. Keying off `libraryId` would
+    /// misclassify that asset as path-hashed and wrongly discard its checksum.
+    pub fn checksum_is_path_hash(&self) -> bool {
+        let Some(path) = &self.original_path else {
+            return false;
+        };
+        let mut hasher = Sha1::new();
+        hasher.update(b"path:");
+        hasher.update(path.as_bytes());
+        BASE64.encode(hasher.finalize()) == self.checksum
     }
 }
 
@@ -860,5 +908,56 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    // ---- SourceAsset::checksum_is_path_hash ---------------------------------------------
+
+    /// Builds a bare-bones `SourceAsset` for exercising `checksum_is_path_hash` in
+    /// isolation — the fields other than `checksum`/`original_path` don't matter to it.
+    fn source_asset(checksum: &str, original_path: Option<&str>) -> SourceAsset {
+        SourceAsset {
+            id: Uuid::nil(),
+            checksum: checksum.to_owned(),
+            filename: "irrelevant.jpg".to_owned(),
+            mime: None,
+            created: Utc::now(),
+            modified: Utc::now(),
+            r#type: dto::AssetTypeEnum::Image,
+            duration: None,
+            original_path: original_path.map(ToOwned::to_owned),
+        }
+    }
+
+    #[test]
+    fn checksum_is_path_hash_true_for_a_real_verified_vector() {
+        // Verified against a live Immich 3.1.0 instance: this exact (originalPath,
+        // checksum) pair is a real external-library asset's path hash.
+        let asset = source_asset(
+            "97NskcQtqUhXp7Pqxa80qkeo0TA=",
+            Some(
+                "/data/fotos/PROJECTS/2025-07-18-SchwedenUrlaub/20250718_200917.324_Pixel 9 Pro.MP.jpg",
+            ),
+        );
+        assert!(asset.checksum_is_path_hash());
+    }
+
+    #[test]
+    fn checksum_is_path_hash_false_for_a_content_hash() {
+        // Same path as the verified vector above, but a checksum that is not its path
+        // hash — e.g. a genuine content hash of the file's bytes.
+        let asset = source_asset(
+            "BZm8Ilo+YBCs4cEz7mB5nV2hyQI=",
+            Some(
+                "/data/fotos/PROJECTS/2025-07-18-SchwedenUrlaub/20250718_200917.324_Pixel 9 Pro.MP.jpg",
+            ),
+        );
+        assert!(!asset.checksum_is_path_hash());
+    }
+
+    #[test]
+    fn checksum_is_path_hash_false_when_original_path_is_none() {
+        // No originalPath to recompute against at all — must not panic, must not guess.
+        let asset = source_asset("97NskcQtqUhXp7Pqxa80qkeo0TA=", None);
+        assert!(!asset.checksum_is_path_hash());
     }
 }
