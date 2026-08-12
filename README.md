@@ -13,15 +13,16 @@ from your copy.
 
 1. [API key permissions](#api-key-permissions)
 2. [Docker Compose](#docker-compose)
-3. [Running the binary directly](#running-the-binary-directly)
-4. [Environment variables](#environment-variables)
-5. [Setting up the share link](#setting-up-the-share-link)
-6. [Export instance version requirement](#export-instance-version-requirement)
-7. [How deduplication works](#how-deduplication-works)
-8. [Known limitations](#known-limitations)
-9. [Secrets with secretspec](#secrets-with-secretspec)
-10. [Troubleshooting](#troubleshooting)
-11. [Development](#development)
+3. [NixOS module](#nixos-module)
+4. [Running the binary directly](#running-the-binary-directly)
+5. [Environment variables](#environment-variables)
+6. [Setting up the share link](#setting-up-the-share-link)
+7. [Export instance version requirement](#export-instance-version-requirement)
+8. [How deduplication works](#how-deduplication-works)
+9. [Known limitations](#known-limitations)
+10. [Secrets with secretspec](#secrets-with-secretspec)
+11. [Troubleshooting](#troubleshooting)
+12. [Development](#development)
 
 ## API key permissions
 
@@ -100,6 +101,64 @@ volumes:
   cache:
 ```
 
+## NixOS module
+
+This flake exposes `nixosModules.default`. It runs the program the way the container does —
+one long-lived process that sleeps `IMPORT_INTERVAL` between passes — under a systemd
+`DynamicUser`, with the content-hash cache in `CacheDirectory` so it survives restarts and
+reboots without any user or directory for you to create.
+
+```nix
+{
+  inputs.immich-federation-at-home.url = "github:paulmiro/immich-federation-at-home";
+
+  outputs = { nixpkgs, immich-federation-at-home, ... }: {
+    nixosConfigurations.myhost = nixpkgs.lib.nixosSystem {
+      system = "x86_64-linux";
+      modules = [
+        immich-federation-at-home.nixosModules.default
+        {
+          services.immich-federation-at-home = {
+            enable = true;
+
+            # Everything except the secrets, named exactly as in the table below. Anything
+            # the program accepts works here, including variables newer than this module.
+            settings = {
+              EXPORT_ALBUM_URL = "https://photos.friend.example/share/AbC123";
+              IMPORT_SERVER_URL = "https://immich.example.com";
+              IMPORT_ALBUM = "Family Photos";
+              IMPORT_INTERVAL = "1h";
+            };
+
+            # IMPORT_API_KEY=… and, if the share link has one, EXPORT_ALBUM_PASSWORD=….
+            # A plain systemd EnvironmentFile, so anything that can drop one at activation
+            # time (sops-nix, agenix, a file you chmod 600 yourself) fits.
+            environmentFile = "/run/secrets/immich-federation-at-home.env";
+          };
+        }
+      ];
+    };
+  };
+}
+```
+
+Options: `enable`, `package` (defaults to this flake's build for the host's system),
+`settings`, `environmentFile`.
+
+`CACHE_DIR` is set by the module and does not belong in `settings` — the service gets
+`CacheDirectory=immich-federation-at-home`, which under `DynamicUser` is really
+`/var/cache/private/immich-federation-at-home` (root-owned, `0700`) reachable as
+`/var/cache/immich-federation-at-home` from inside the unit. systemd re-chowns it to
+whichever uid it allocates on the next start, so the cache keeps working across restarts
+even though the user is different every time.
+
+Keep secrets out of `settings`: it becomes `Environment=` lines in a unit file in the
+world-readable Nix store. The module emits a build-time warning if it spots
+`IMPORT_API_KEY` or `EXPORT_ALBUM_PASSWORD` there.
+
+Assets are staged in `/tmp`, which `DynamicUser` makes private to the service. If `/tmp` is
+a tmpfs too small for the largest asset in the album, set `TMPDIR` in `settings`.
+
 ## Running the binary directly
 
 Three ways to get a binary, all verified against this repo:
@@ -113,8 +172,9 @@ Three ways to get a binary, all verified against this repo:
 
 ### systemd unit + timer
 
-For a `RUN_ONCE=1`-per-invocation setup driven by systemd instead of the program's own
-built-in interval loop, run as a dedicated non-root user:
+On NixOS use the [module](#nixos-module) instead. Elsewhere, for a `RUN_ONCE`-per-invocation
+setup driven by systemd instead of the program's own built-in interval loop, run as a
+dedicated non-root user:
 
 ```ini
 # /etc/systemd/system/immich-federation-at-home.service
@@ -169,7 +229,7 @@ binary with `--help` to see the same information generated live from the same st
 | `TRANSFER_TIMEOUT`      | no       | `30m`   | Timeout for downloading and re-uploading a single asset.                                          |
 | `RUN_ONCE`              | no       | `false` | Do one sync pass and exit instead of looping with `IMPORT_INTERVAL` between runs. Also settable via `--once`. Only `true`/`false` are accepted from the environment — not `1`/`0`. |
 | `TMPDIR`                | no       | system  | Where assets are staged during transfer (read by the `tempfile` crate directly, not by this program's own code — see the Docker Compose `tmpfs` note above for sizing). |
-| `CACHE_DIR`             | no       | unset, but **the container image sets it** to `/cache` | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). With no value at all — which in practice means running the binary directly, not the image — the cache is disabled entirely; nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. Setting it to the empty string does **not** disable it: an empty environment variable is still a value, and the program then fails to create a directory with no name. |
+| `CACHE_DIR`             | no       | unset, but **the container image sets it** to `/cache` and **the NixOS module sets it** to `/var/cache/immich-federation-at-home` | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). With no value at all — which in practice means running the binary directly, not the image — the cache is disabled entirely; nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. Setting it to the empty string does **not** disable it: an empty environment variable is still a value, and the program then fails to create a directory with no name. |
 
 Every flag has an equivalent `--kebab-case-flag`; a flag wins over its environment
 variable if both are set (`--help` shows the full mapping).
