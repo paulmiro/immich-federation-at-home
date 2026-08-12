@@ -61,6 +61,9 @@
             }
           );
 
+          version = self'.packages.default.version;
+          imageName = "ghcr.io/paulmiro/immich-federation-at-home";
+
           # apps.update-openapi wraps scripts/update-openapi.sh, which is the single source
           # of truth: this just supplies its runtime deps (curl, jq, git) so `nix run
           # .#update-openapi` works on a machine with none of them on PATH, then execs the
@@ -76,13 +79,27 @@
               exec "${./scripts/update-openapi.sh}" "$@"
             '';
           };
+
+          docker-push = pkgs.writeShellApplication {
+            name = "docker-push";
+            runtimeInputs = [ pkgs.skopeo ];
+            text = ''
+              for tag in "${version}" latest; do
+                echo "pushing ${imageName}:$tag"
+                skopeo copy \
+                  "docker-archive:${self'.packages.docker}" \
+                  "docker://${imageName}:$tag" \
+                  "$@"
+              done
+            '';
+          };
         in
         {
           packages.default = immich-federation-at-home;
 
           packages.docker = pkgs.dockerTools.buildLayeredImage {
-            name = "immich-federation-at-home";
-            tag = "latest";
+            name = imageName;
+            tag = version;
             contents = [
               pkgs.cacert
               pkgs.dockerTools.fakeNss
@@ -152,13 +169,18 @@
               rustfmt
               jq
               curl
-              docker-compose
+              secretspec
             ];
           };
 
           apps.update-openapi = {
             program = "${update-openapi}/bin/update-openapi";
             meta.description = "Refresh openapi/immich-openapi-3.1.0.json from upstream";
+          };
+
+          apps.docker-push = {
+            program = "${docker-push}/bin/docker-push";
+            meta.description = "Push the Docker image to ghcr.io";
           };
 
           # `pkgs.nixfmt-rfc-style` is now an alias for `pkgs.nixfmt` and warns on evaluation.
