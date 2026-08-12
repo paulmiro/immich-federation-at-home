@@ -240,9 +240,13 @@ how long it survives: see the [Docker Compose](#docker-compose) snippet.
 
 ## Known limitations
 
-* **Live photos**: the still and motion-video parts are separate assets in Immich. If the
-  share link exposes both, each gets uploaded as its own asset — the pairing between them
-  is not reconstructed on the import side.
+* **Live photos**: the motion-video half is skipped, never uploaded as a standalone clip.
+  Immich marks it `visibility: hidden` — both for a separately uploaded video (iPhone) and
+  for one it extracted from an embedded motion photo (Pixel/Samsung `.MP.jpg`) — and hidden
+  assets are excluded from the transfer. Embedded motion photos survive the round trip
+  anyway, because the still's own bytes contain the video and the import instance extracts
+  and re-links it itself; for a separately uploaded video the motion part is simply not
+  transferred, and the still↔video pairing is not reconstructed on the import side.
 * **v3.0.3+ only** on the export side (see above).
 * **Additive only**: deletions and album removals on the source are never mirrored to the
   import side.

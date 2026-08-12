@@ -140,6 +140,25 @@ pub enum AssetTypeEnum {
     Unrecognized,
 }
 
+/// `AssetVisibility`. `jq '.components.schemas.AssetVisibility'` → `enum: ["archive",
+/// "timeline", "hidden", "locked"]`.
+///
+/// Only `Hidden` is acted on (see
+/// [`ExportClient::list_album_assets`](crate::immich::export::ExportClient::list_album_assets)):
+/// it is the flag Immich puts on the motion-video half of a live photo, so those are
+/// skipped rather than uploaded as standalone video clips. The other variants exist so the
+/// value round-trips through `serde` — an archived asset is transferred like any other.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AssetVisibility {
+    Archive,
+    Timeline,
+    Hidden,
+    Locked,
+    #[serde(other)]
+    Unrecognized,
+}
+
 /// The subset of `AssetResponseDto` §6 step 1 needs. `jq
 /// '.components.schemas.AssetResponseDto'` → `required` includes `checksum`, `duration`
 /// (nullable — see below), `fileCreatedAt`, `fileModifiedAt`, `id`, `originalFileName`,
@@ -195,6 +214,12 @@ pub struct AssetResponseDto {
     /// compatibility — see the struct doc comment.
     #[serde(default)]
     pub original_path: Option<String>,
+    /// Spec-required and non-nullable, modelled as `Option` anyway for the same reason
+    /// `original_path` is — see the struct doc comment. `None` (a server that stopped
+    /// sending the field) means "not hidden", i.e. transfer it, which is what this tool did
+    /// before the field was modelled at all.
+    #[serde(default)]
+    pub visibility: Option<AssetVisibility>,
 }
 
 /// `SearchResponseDto` — the top-level `POST /search/metadata` response. `jq
@@ -646,6 +671,32 @@ mod tests {
         }"#;
         let asset: AssetResponseDto = serde_json::from_str(json).unwrap();
         assert_eq!(asset.original_path, None);
+    }
+
+    #[test]
+    fn asset_response_visibility_deserializes_and_defaults_to_none() {
+        let json = r#"{
+            "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+            "checksum": "abc=",
+            "originalFileName": "IMG_4312.MOV",
+            "type": "VIDEO",
+            "fileCreatedAt": "2026-05-01T12:00:00.000Z",
+            "fileModifiedAt": "2026-05-01T12:00:01.000Z",
+            "visibility": "hidden",
+            "duration": 1500
+        }"#;
+        let asset: AssetResponseDto = serde_json::from_str(json).unwrap();
+        assert_eq!(asset.visibility, Some(AssetVisibility::Hidden));
+
+        let without = json.replace(r#""visibility": "hidden","#, "");
+        let asset: AssetResponseDto = serde_json::from_str(&without).unwrap();
+        assert_eq!(asset.visibility, None);
+    }
+
+    #[test]
+    fn asset_visibility_unknown_variant_is_forward_compatible() {
+        let v: AssetVisibility = serde_json::from_str(r#""quarantined""#).unwrap();
+        assert_eq!(v, AssetVisibility::Unrecognized);
     }
 
     #[test]

@@ -30,7 +30,7 @@ use crate::immich::{
 };
 use crate::retry::{RetryPolicy, Retryable};
 use crate::share_url::ShareRef;
-use crate::{debug, error, warn};
+use crate::{debug, error, info, warn};
 
 /// How many assets `POST /search/metadata` (E4) is asked for per page. `PLAN.md` §6 step 1
 /// fixes this at 250.
@@ -395,6 +395,23 @@ impl ExportClient {
     /// been collected. Assets with an empty checksum are logged at `error` and excluded (see
     /// [`EmptyChecksumError`]) rather than failing the whole run.
     ///
+    /// Assets whose `visibility` is `hidden` are excluded too. `hidden` is what Immich sets
+    /// on the *motion-video half of a live photo* — both when it links a separately uploaded
+    /// video (`utils/asset.util.ts`, `onBeforeLink`) and when it extracts an embedded one
+    /// from a Google/Samsung motion photo (`services/metadata.service.ts`). Such a video is
+    /// not a library item in its own right: the export instance never shows it in a
+    /// timeline, and uploading it here would land a few seconds of silent, unpaired footage
+    /// in the import instance's library as a standalone video. The still half is transferred
+    /// as usual — for an embedded motion photo the bytes contain the video, so the import
+    /// instance re-extracts and re-links it itself; for a separately uploaded one the
+    /// pairing is lost, which is the pre-existing live-photo limitation in `README.md`.
+    ///
+    /// In practice this filter rarely fires, because Immich removes a motion asset from
+    /// every album at the moment it links it (`albumRepository.removeAssetsFromAll`), and
+    /// this search is scoped to one album. It matters for the cases that slip through that:
+    /// an asset added to the album before extraction ran, and an export instance older than
+    /// the version that added the album cleanup.
+    ///
     /// Two independent guards against a misbehaving server turning this into an infinite
     /// loop: [`MAX_SEARCH_PAGES`] caps the total number of pages followed, and — since
     /// `nextPage` is spec-typed as an opaque nullable string rather than a number
@@ -406,6 +423,7 @@ impl ExportClient {
     pub async fn list_album_assets(&self, album_id: Uuid) -> Result<Vec<SourceAsset>, ExportError> {
         let url = self.share_ref.apply(self.url("/search/metadata"));
         let mut assets = Vec::new();
+        let mut hidden = 0_usize;
         let mut page: u32 = 1;
         let mut previous_next_page: Option<String> = None;
 
@@ -438,6 +456,14 @@ impl ExportClient {
             );
 
             for item in response.assets.items {
+                if item.visibility == Some(dto::AssetVisibility::Hidden) {
+                    hidden += 1;
+                    debug!(
+                        "skipping hidden asset album_id={album_id} export_id={} filename={}",
+                        item.id, item.original_file_name
+                    );
+                    continue;
+                }
                 match SourceAsset::try_from(item) {
                     Ok(asset) => assets.push(asset),
                     Err(err) => error!(
@@ -457,6 +483,13 @@ impl ExportClient {
                     page += 1;
                 }
             }
+        }
+
+        if hidden > 0 {
+            info!(
+                "excluded hidden assets from album album_id={album_id} count={hidden} \
+                 (live-photo motion parts)"
+            );
         }
 
         Ok(assets)
@@ -821,6 +854,44 @@ mod tests {
 
         assert_eq!(assets.len(), 1);
         assert_eq!(assets[0].filename, "IMG_2.jpg");
+    }
+
+    #[tokio::test]
+    async fn list_album_assets_skips_hidden_assets_and_keeps_every_other_visibility() {
+        // `hidden` is the live-photo motion half; `archive` is an ordinary asset the user
+        // archived and must still be transferred. A page mixing the two must yield only the
+        // non-hidden ones, in order.
+        let app = Router::new().route(
+            "/search/metadata",
+            post(|| async {
+                let mut hidden = asset_json(1);
+                hidden["visibility"] = json!("hidden");
+                hidden["type"] = json!("VIDEO");
+                let mut archived = asset_json(2);
+                archived["visibility"] = json!("archive");
+                let mut timeline = asset_json(3);
+                timeline["visibility"] = json!("timeline");
+                Json(json!({
+                    "albums": {"total": 0, "items": []},
+                    "assets": {
+                        "items": [hidden, archived, timeline, asset_json(4)],
+                        "nextPage": null, "total": 4, "count": 4
+                    }
+                }))
+            }),
+        );
+        let (base, _server) = spawn_test_server(Router::new().nest("/api", app)).await;
+        let export = client(&base, key_ref());
+
+        let assets = export
+            .list_album_assets(Uuid::parse_str("9c858901-8a57-4791-81fe-4c455b099bc9").unwrap())
+            .await
+            .unwrap();
+
+        // `asset_json(4)` carries no `visibility` key at all — a server that stopped sending
+        // the field must not have its assets silently dropped.
+        let names: Vec<&str> = assets.iter().map(|a| a.filename.as_str()).collect();
+        assert_eq!(names, ["IMG_2.jpg", "IMG_3.jpg", "IMG_4.jpg"]);
     }
 
     #[tokio::test]
