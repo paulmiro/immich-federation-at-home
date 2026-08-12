@@ -79,13 +79,16 @@ services:
       # the container's writable layer on disk instead, if RAM is tight.
       - /tmp:size=8g
     volumes:
-      # Optional, but strongly recommended if the source album has assets from an Immich
-      # external library (see "How deduplication works" below) — without it, such an asset
-      # is re-downloaded from scratch every run instead of once. A *named* volume, not a
-      # bind mount: the image already creates CACHE_DIR owned by uid 65532 (the uid the
-      # container runs as), and a named volume inherits that ownership automatically. A
-      # bind-mounted host directory is root-owned by default and will hit a fatal startup
-      # error until you `chown 65532:65532` it yourself.
+      # Strongly recommended if the source album has assets from an Immich external library
+      # (see "How deduplication works" below). The image already sets CACHE_DIR, so the
+      # cache exists either way — this only decides where it lives. Without this volume it
+      # sits in the container's writable layer, which survives restarts but is thrown away
+      # whenever the container is re-created (`down` then `up`, an image upgrade, any
+      # compose change), costing a full re-download of every external-library asset each
+      # time. A *named* volume, not a bind mount: the image creates CACHE_DIR owned by uid
+      # 65532, the uid the container runs as, and a named volume inherits that ownership
+      # automatically. A bind-mounted host directory is root-owned by default and will hit
+      # a fatal startup error until you `chown 65532:65532` it yourself.
       - cache:/var/cache/immich-federation-at-home
 
 volumes:
@@ -161,7 +164,7 @@ binary with `--help` to see the same information generated live from the same st
 | `TRANSFER_TIMEOUT`      | no       | `30m`   | Timeout for downloading and re-uploading a single asset.                                          |
 | `RUN_ONCE`              | no       | `false` | Do one sync pass and exit instead of looping with `IMPORT_INTERVAL` between runs. Also settable via `--once`. Only `true`/`false` are accepted from the environment — not `1`/`0`. |
 | `TMPDIR`                | no       | system  | Where assets are staged during transfer (read by the `tempfile` crate directly, not by this program's own code — see the Docker Compose `tmpfs` note above for sizing). |
-| `CACHE_DIR`             | no       | unset   | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). Unset disables the cache entirely — nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. |
+| `CACHE_DIR`             | no       | unset, but **the container image sets it** to `/var/cache/immich-federation-at-home` | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). With no value at all — which in practice means running the binary directly, not the image — the cache is disabled entirely; nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. Setting it to the empty string does **not** disable it: an empty environment variable is still a value, and the program then fails to create a directory with no name. |
 
 Every flag has an equivalent `--kebab-case-flag`; a flag wins over its environment
 variable if both are set (`--help` shows the full mapping).
@@ -225,10 +228,15 @@ rather than guessing, so it can never misidentify an ordinary uploaded asset. Th
 time it downloads such an asset it learns the real content hash and, if `CACHE_DIR` is
 set, remembers it (keyed by the path hash, guarded by the file's modification time) so a
 later run can dedup and verify it exactly like any other asset without downloading it
-again. Without `CACHE_DIR`, these assets still transfer correctly — they're just
+again. With no `CACHE_DIR` at all, these assets still transfer correctly — they're just
 re-downloaded every run, since there's nowhere to remember the content hash between runs.
 This only matters at all if the source album has external-library assets in it; ordinary
 uploaded assets are unaffected either way.
+
+Note that the container image sets `CACHE_DIR` itself, so **the cache is always on in the
+container** — you only get the no-cache behaviour by running the binary directly with the
+variable unset. What the compose volume decides is where that cache lives, and therefore
+how long it survives: see the [Docker Compose](#docker-compose) snippet.
 
 ## Known limitations
 
@@ -305,7 +313,13 @@ whatever provider is configured (keyring, 1Password, sops, …) — see
   of three ways: use a named Docker volume instead of a bind mount (see
   [Docker Compose](#docker-compose) — it inherits the right ownership automatically);
   `chown 65532:65532` the bind-mounted host directory yourself, since that's the uid the
-  container image runs as; or unset `CACHE_DIR` to run without a cache.
+  container image runs as; or, if you are running the binary directly, unset `CACHE_DIR`
+  to run without a cache. Removing `CACHE_DIR` from your compose file does *not* achieve
+  the last one — the image sets it, so the value comes back. Point it somewhere writable
+  and disposable like `/tmp` if you really want the container not to keep a cache.
+* **The cache is empty again after every deploy.** Expected without a volume: `CACHE_DIR`
+  then lives in the container's writable layer, which is discarded whenever the container
+  is re-created. Add the named volume from the [Docker Compose](#docker-compose) snippet.
 
 ## Development
 

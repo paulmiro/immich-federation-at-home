@@ -138,6 +138,8 @@ pub struct Config {
     /// matters when the export album contains assets from an Immich external library
     /// (ordinary uploaded assets are unaffected either way). Leave unset to disable the
     /// cache entirely — every run then re-downloads external-library assets from scratch.
+    /// The container image sets this itself, so there the cache is always on and the
+    /// question is only whether a volume is mounted over it.
     #[arg(long, env = "CACHE_DIR")]
     pub cache_dir: Option<PathBuf>,
 }
