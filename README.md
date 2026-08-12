@@ -78,7 +78,18 @@ services:
       # several GB), not the album total. Omit `tmpfs:` entirely to let it fall back to
       # the container's writable layer on disk instead, if RAM is tight.
       - /tmp:size=8g
-    # No volumes: the program is fully stateless (see "How deduplication works" below).
+    volumes:
+      # Optional, but strongly recommended if the source album has assets from an Immich
+      # external library (see "How deduplication works" below) — without it, such an asset
+      # is re-downloaded from scratch every run instead of once. A *named* volume, not a
+      # bind mount: the image already creates CACHE_DIR owned by uid 65534 (the uid the
+      # container runs as), and a named volume inherits that ownership automatically. A
+      # bind-mounted host directory is root-owned by default and will hit a fatal startup
+      # error until you `chown 65534:65534` it yourself.
+      - cache:/var/cache/immich-federation-at-home
+
+volumes:
+  cache:
 ```
 
 ## Running the binary directly
@@ -150,6 +161,7 @@ binary with `--help` to see the same information generated live from the same st
 | `TRANSFER_TIMEOUT`      | no       | `30m`   | Timeout for downloading and re-uploading a single asset.                                          |
 | `RUN_ONCE`              | no       | `false` | Do one sync pass and exit instead of looping with `IMPORT_INTERVAL` between runs. Also settable via `--once`. Only `true`/`false` are accepted from the environment — not `1`/`0`. |
 | `TMPDIR`                | no       | system  | Where assets are staged during transfer (read by the `tempfile` crate directly, not by this program's own code — see the Docker Compose `tmpfs` note above for sizing). |
+| `CACHE_DIR`             | no       | unset   | Directory for the content-hash cache (see [How deduplication works](#how-deduplication-works)). Unset disables the cache entirely — nothing is lost, external-library assets are just re-downloaded every run. If set and the directory can't be created or written, the program exits at startup rather than failing later. |
 
 Every flag has an equivalent `--kebab-case-flag`; a flag wins over its environment
 variable if both are set (`--help` shows the full mapping).
@@ -187,13 +199,36 @@ checksum?" Assets it already has are skipped; only the rest are downloaded and
 re-uploaded, then all of them (fresh and pre-existing) are added to the target album,
 which is itself idempotent.
 
-This means the program keeps **no state of its own** — no database, no cache file. The
-only disk use is a temporary file per asset while it's actively being transferred, so
-losing all on-disk data is always trivially recoverable (there is none to lose). The
-trade-off: if you permanently delete an imported asset from your instance, dedup no
-longer sees its checksum, and the next run re-imports it. Assets sitting in your instance's
-trash are detected and logged as already-present (not re-uploaded), so trashing one has
-no such effect.
+This means the program keeps **no state it needs to be correct** — no database, and no
+cache file is required for dedup to work. The only disk use step 3 needs is a temporary
+file per asset while it's actively being transferred, so losing all on-disk data is
+always trivially recoverable. The trade-off: if you permanently delete an imported asset
+from your instance, dedup no longer sees its checksum, and the next run re-imports it.
+Assets sitting in your instance's trash are detected and logged as already-present (not
+re-uploaded), so trashing one has no such effect.
+
+### External-library assets
+
+There's one wrinkle to the checksum story above. If the source album contains an asset
+that came from an Immich **external library** on the export instance (as opposed to a
+normally-uploaded one), the "checksum" that instance reports for it isn't a hash of the
+file's contents at all — Immich hashes external-library assets by their *path* on disk
+(`sha1("path:" + originalPath)`) instead of opening the file, and the API gives us no way
+to tell which kind of checksum we're looking at (`checksumAlgorithm` isn't exposed). Left
+unhandled, that breaks dedup for exactly these assets in two ways: the `checksum` sent to
+`bulk-upload-check` can never match anything on the import instance (which always
+content-hashes on upload), and once downloaded, the bytes can never be verified against a
+"checksum" that was never a hash of those bytes to begin with.
+
+The program detects this positively — it recomputes the path hash itself and compares —
+rather than guessing, so it can never misidentify an ordinary uploaded asset. The first
+time it downloads such an asset it learns the real content hash and, if `CACHE_DIR` is
+set, remembers it (keyed by the path hash, guarded by the file's modification time) so a
+later run can dedup and verify it exactly like any other asset without downloading it
+again. Without `CACHE_DIR`, these assets still transfer correctly — they're just
+re-downloaded every run, since there's nowhere to remember the content hash between runs.
+This only matters at all if the source album has external-library assets in it; ordinary
+uploaded assets are unaffected either way.
 
 ## Known limitations
 
@@ -210,6 +245,15 @@ no such effect.
   expose them. Embedded EXIF survives, since the original file bytes are uploaded
   untouched.
 * **Album metadata** (description, sort order, cover photo) is not synced — only assets.
+* **No corruption detection for external-library assets**: for a normal asset, the
+  downloaded bytes are checked against the source checksum before upload. For an
+  external-library asset with no cached content hash yet, that checksum is a path hash,
+  not a content hash — there is nothing trustworthy to compare the download against, so a
+  corrupted download can only be caught by a byte-count mismatch, not a hash mismatch.
+* **A same-mtime edit to an external-library file goes unnoticed** by the cache. A cache
+  entry is invalidated only when the file's modification time changes; an edit that
+  happens to leave the mtime (and size) unchanged would serve a stale cached content hash
+  instead of triggering a re-download. Out of scope by explicit decision.
 
 ## Secrets with secretspec
 
@@ -256,6 +300,12 @@ whatever provider is configured (keyring, 1Password, sops, …) — see
 * **An asset is logged as `unsupported format` and skipped.** The import instance's own
   upload validation rejected it (e.g. a file type it doesn't support). This is permanent —
   the program does not retry it on later runs.
+* **Startup fails saying `CACHE_DIR` could not be created or written.** This is always a
+  permissions problem, and it's fatal on purpose rather than a surprise later. Fix it one
+  of three ways: use a named Docker volume instead of a bind mount (see
+  [Docker Compose](#docker-compose) — it inherits the right ownership automatically);
+  `chown 65534:65534` the bind-mounted host directory yourself, since that's the uid the
+  container image runs as; or unset `CACHE_DIR` to run without a cache.
 
 ## Development
 
