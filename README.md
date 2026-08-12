@@ -48,9 +48,14 @@ nix build .#docker
 docker load < result
 ```
 
-This produces an image tagged `immich-federation-at-home:latest`. It's built with
-`dockerTools.buildLayeredImage` for `x86_64-linux`; cross-building for `aarch64-linux` is
-out of scope (build it *on* the aarch64 machine and it'll produce a native image there).
+This produces an image tagged `ghcr.io/paulmiro/immich-federation-at-home:0.1.0`, built with
+`dockerTools.buildLayeredImage` for the architecture of the machine you are on.
+
+Both architectures can be built from either kind of machine, since the crate is
+cross-compiled rather than emulated: `nix build .#docker-amd64` and `nix build
+.#docker-arm64` name the target explicitly. `nix run .#docker-push` builds both, pushes each
+under its own tag (`:0.1.0-amd64`, `:0.1.0-arm64`), and then publishes `:0.1.0` and `:latest`
+as an OCI image index over the two, so a plain `docker pull` resolves to the right one.
 
 ```yaml
 services:
