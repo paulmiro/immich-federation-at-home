@@ -123,23 +123,31 @@ full config format, including secrets and precedence.
   services.immich-federation-at-home = {
     enable = true;
 
-    # Any of the environment variables below, except the secrets.
+    # Rendered straight to the program's TOML config file. Keys next to `jobs` are the
+    # default for every job that does not set them itself.
     settings = {
-      EXPORT_ALBUM_URL = "https://photos.friend.example/share/AbC123";
-      IMPORT_SERVER_URL = "https://immich.example.com";
-      IMPORT_ALBUM = "Family Photos";
-      INTERVAL = "1h";
+      import_server_url = "https://immich.example.com";
+      import_api_key_env = "IMPORT_API_KEY";
+
+      jobs.family = {
+        export_album_url = "https://photos.friend.example/share/AbC123";
+        import_album = "Family Photos";
+        interval = "1h";
+      };
     };
 
-    # IMPORT_API_KEY=… and, if the share link has one, EXPORT_ALBUM_PASSWORD=….
+    # Holds IMPORT_API_KEY=… (the variable named by `import_api_key_env` above).
     environmentFile = "/run/secrets/immich-federation-at-home.env";
   };
 }
 ```
 
-For several jobs, or a secret read from a file instead of an environment file, set
-`services.immich-federation-at-home.jobs.<name>` instead — see that option's own
-description for the full per-job key list.
+`settings` mirrors the config file one-to-one, so `nix eval` on it and the file the service
+reads say the same thing — see [Running several jobs in one
+process](#running-several-jobs-in-one-process) for the full format. Secrets can also be read
+from a file at startup with the `_file` spelling of each key (`import_api_key_file`,
+`export_album_password_file`), pointing at a systemd `LoadCredential` or a sops-nix/agenix
+path.
 
 ## Running the binary directly
 

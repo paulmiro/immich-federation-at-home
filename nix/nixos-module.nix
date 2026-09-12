@@ -13,91 +13,163 @@ in
     let
       cfg = config.services.${name};
 
-      # systemd wants strings. `toString true` is "1", which the program does not accept for
-      # RUN_ONCE (clap only takes the literal "true"/"false"), so booleans are spelled out.
-      toEnvValue = value: if lib.isBool value then lib.boolToString value else toString value;
+      optionalStr = description: {
+        type = lib.types.nullOr lib.types.str;
+        default = null;
+        inherit description;
+      };
 
-      # Per-job options are named after the program's own TOML keys (snake_case) rather than
-      # Nix's usual camelCase: this option is rendered straight into the config file, so
-      # keeping the two spellings identical means the option and the TOML it produces are
-      # obviously the same thing, with no translation table to keep in your head.
+      # Every option here is named after the config-file key it becomes (snake_case, not
+      # Nix's usual camelCase): `settings` is rendered straight to TOML, so keeping the two
+      # spellings identical means the option and the file it produces are obviously the same
+      # thing, with no translation table to keep in your head.
       secretOptions = secretName: {
-        ${secretName} = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = ''
-            ${secretName}, inline. Puts it in the world-readable Nix store — prefer
-            `${secretName}_file` or `${secretName}_env`.
-          '';
-        };
-        "${secretName}_file" = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = ''
-            Path to read `${secretName}` from at startup (trailing newline trimmed). Point
-            it at a systemd `LoadCredential` (`%d/…`) or a sops-nix/agenix path. A plain
-            string, not a Nix path, so a `%d/…` specifier isn't misread as a store path.
-          '';
-        };
-        "${secretName}_env" = lib.mkOption {
-          type = lib.types.nullOr lib.types.str;
-          default = null;
-          description = "Name of an environment variable holding `${secretName}`, read at startup.";
+        ${secretName} = lib.mkOption (optionalStr ''
+          ${secretName}, inline. Puts it in the world-readable Nix store — prefer
+          `${secretName}_file` or `${secretName}_env`.
+        '');
+        "${secretName}_file" = lib.mkOption (optionalStr ''
+          Path to read `${secretName}` from at startup (trailing newline trimmed). Point
+          it at a systemd `LoadCredential` (`%d/…`) or a sops-nix/agenix path. A plain
+          string, not a Nix path, so a `%d/…` specifier isn't misread as a store path.
+        '');
+        "${secretName}_env" = lib.mkOption (
+          optionalStr "Name of an environment variable holding `${secretName}`, read at startup."
+        );
+      };
+
+      # Shared by one job and by the top level, where the same keys act as the default for
+      # every job that does not set them itself.
+      jobOptions = {
+        export_album_url = lib.mkOption (optionalStr "Share link for the album to mirror.");
+        import_server_url = lib.mkOption (
+          optionalStr "Your own instance, e.g. `https://immich.example.com`."
+        );
+        import_album = lib.mkOption (
+          optionalStr "Target album: a UUID, or an exact, already-existing album name."
+        );
+        interval = lib.mkOption (
+          optionalStr "How often to check for new assets (`30m`, `1h30m`, `6h`, …). Default: `1h`."
+        );
+        request_timeout = lib.mkOption (optionalStr "Timeout for metadata calls. Default: `30s`.");
+        transfer_timeout = lib.mkOption (
+          optionalStr "Timeout for transferring a single asset. Default: `30m`."
+        );
+      }
+      // secretOptions "export_album_password"
+      // secretOptions "import_api_key";
+
+      settingsModule = lib.types.submodule {
+        options = jobOptions // {
+          log_level = lib.mkOption {
+            type = lib.types.nullOr (
+              lib.types.enum [
+                "error"
+                "warn"
+                "info"
+                "debug"
+                "trace"
+              ]
+            );
+            default = null;
+            description = "Log verbosity. Default: `info`.";
+          };
+
+          cache_dir = lib.mkOption {
+            type = lib.types.nullOr lib.types.str;
+            default = "/var/cache/${name}";
+            description = ''
+              Directory for the content-hash cache, shared by every job. `null` disables
+              persisting it, so every restart re-checksums whatever it downloads.
+            '';
+          };
+
+          tmp_dir = lib.mkOption (optionalStr ''
+            Directory used to stage each asset while it is in flight. Set this if the
+            service's `/tmp` is a tmpfs too small for `transfer_concurrency` times the
+            largest single asset across every job.
+          '');
+
+          transfer_concurrency = lib.mkOption {
+            type = lib.types.nullOr lib.types.ints.positive;
+            default = null;
+            description = ''
+              How many assets to transfer at once, across every job in the process.
+              Default: `4`.
+            '';
+          };
+
+          jobs = lib.mkOption {
+            type = lib.types.attrsOf (lib.types.submodule { options = jobOptions; });
+            default = { };
+            description = ''
+              Jobs to run, keyed by a name that only ever shows up in logs. At least one is
+              required. A key left unset here falls back to the same key set next to
+              {option}`jobs`, which is how several jobs share one import instance and API
+              key. Inheritance is per key, not per spelling: a job that sets any one of
+              `import_api_key`, `_file` or `_env` ignores all three of the inherited ones.
+            '';
+          };
         };
       };
 
-      jobModule = lib.types.submodule {
-        options = {
-          export_album_url = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Share link for the album to mirror. Required.";
-          };
-          import_server_url = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Your own instance, e.g. `https://immich.example.com`. Required.";
-          };
-          import_album = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Target album: a UUID, or an exact, already-existing album name. Required.";
-          };
-          interval = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "How often to check for new assets (`30m`, `1h30m`, `6h`, …). Program default: `1h`.";
-          };
-          request_timeout = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Timeout for metadata calls. Program default: `30s`.";
-          };
-          transfer_timeout = lib.mkOption {
-            type = lib.types.nullOr lib.types.str;
-            default = null;
-            description = "Timeout for transferring a single asset. Program default: `30m`.";
-          };
-        }
-        // secretOptions "export_album_password"
-        // secretOptions "import_api_key";
-      };
-
-      # `null` means "not set" and is dropped below, so the program's own default (or its
-      # required-key error, for the fields with no default) applies -- this module doesn't
-      # duplicate that validation.
+      # `null` means "not set", and is dropped rather than rendered, so the program's own
+      # default (or its required-key error) applies.
       dropNulls = lib.filterAttrs (_: v: v != null);
 
-      hasJobs = cfg.jobs != { };
-
       tomlFormat = pkgs.formats.toml { };
-      configFile = tomlFormat.generate "${name}-config.toml" {
-        jobs = lib.mapAttrs (_: dropNulls) cfg.jobs;
-      };
+      configFile = tomlFormat.generate "${name}-config.toml" (
+        dropNulls (builtins.removeAttrs cfg.settings [ "jobs" ])
+        // {
+          jobs = lib.mapAttrs (_: dropNulls) cfg.settings.jobs;
+        }
+      );
 
-      jobHasInlineSecret = lib.any (
-        job: job.export_album_password != null || job.import_api_key != null
-      ) (lib.attrValues cfg.jobs);
+      # A job's own spelling of a secret wins over the inherited one as a set of three, so
+      # "is it set here" is asked of a whole table, never of a single spelling.
+      secretSpellings =
+        table: key:
+        lib.count (v: v != null) [
+          table.${key}
+          table."${key}_file"
+          table."${key}_env"
+        ];
+      inheritedValue = job: key: if job.${key} != null then job.${key} else cfg.settings.${key};
+      hasSecret = job: key: secretSpellings job key > 0 || secretSpellings cfg.settings key > 0;
+
+      secretKeys = [
+        "export_album_password"
+        "import_api_key"
+      ];
+
+      jobAssertions =
+        jobName: job:
+        map
+          (key: {
+            assertion = inheritedValue job key != null;
+            message =
+              "services.${name}.settings.jobs.${jobName}.${key} is not set, and neither is the "
+              + "default in services.${name}.settings.${key}.";
+          })
+          [
+            "export_album_url"
+            "import_server_url"
+            "import_album"
+          ]
+        ++ [
+          {
+            assertion = hasSecret job "import_api_key";
+            message =
+              "services.${name}.settings.jobs.${jobName} has no import_api_key, import_api_key_file "
+              + "or import_api_key_env, and neither does services.${name}.settings.";
+          }
+        ]
+        ++ map (key: {
+          assertion = secretSpellings job key <= 1;
+          message =
+            "services.${name}.settings.jobs.${jobName} sets ${key} more than once — use only one "
+            + "of ${key}, ${key}_file or ${key}_env.";
+        }) secretKeys;
     in
     {
       options.services.${name} = {
@@ -111,37 +183,35 @@ in
         };
 
         settings = lib.mkOption {
-          type =
-            with lib.types;
-            attrsOf (oneOf [
-              str
-              int
-              bool
-            ]);
-          default = { };
+          type = settingsModule;
           example = {
-            EXPORT_ALBUM_URL = "https://photos.friend.example/share/AbC123";
-            IMPORT_SERVER_URL = "https://immich.example.com";
-            IMPORT_ALBUM = "Family Photos";
-            INTERVAL = "1h";
+            import_server_url = "https://immich.example.com";
+            import_api_key_file = "%d/immich-api-key";
+            jobs = {
+              family = {
+                export_album_url = "https://their-immich.example.com/s/some-shared-album";
+                export_album_password_file = "%d/family-link-password";
+                import_album = "Family Photos";
+              };
+              hiking = {
+                export_album_url = "https://their-other-immich.example.com/s/some-shared-album";
+                import_album = "Family Photos"; # same album as `family`, deliberately
+                interval = "12h"; # slow server, don't hammer it
+              };
+            };
           };
           description = ''
-            Environment variables for the service. `CACHE_DIR` is already set correctly.
+            The program's configuration file, rendered to TOML and passed to the service.
+            Options are named after the file's own keys, so `nix eval` on this option and
+            the file the service reads say the same thing.
 
-            These are the process-global keys (`LOG_LEVEL`, `TMPDIR`, `TRANSFER_CONCURRENCY`,
-            …) and the escape hatch for anything {option}`services.${name}.jobs` does not
-            model yet. A rendered config file's own keys beat the environment, but a global
-            key left out of the file (which is every global key, since this module only ever
-            renders `jobs`) falls back to `settings` exactly as before -- so `settings` keeps
-            working as the way to set globals whether or not `jobs` is in use.
+            Keys set next to {option}`jobs` are the default for every job that does not set
+            them itself.
 
-            Per-job keys set here (`EXPORT_ALBUM_URL`, `IMPORT_ALBUM`, …) are read only when
-            {option}`services.${name}.jobs` is empty, where they describe the single implicit
-            job; once `jobs` renders a config file, the program does not consult the
-            environment for job keys at all, so these are silently ignored -- use
-            {option}`services.${name}.jobs` instead.
-
-            Do NOT put secrets here, use {option}`services.${name}.environmentFile` instead.
+            Secrets put here directly land in the world-readable Nix store: prefer the
+            `_file` spelling of each (pointing at a systemd `LoadCredential` or a
+            sops-nix/agenix path), or `_env` together with
+            {option}`services.${name}.environmentFile`.
           '';
         };
 
@@ -149,49 +219,34 @@ in
           type = lib.types.nullOr lib.types.path;
           default = null;
           example = "/run/secrets/immich-federation-at-home.env";
-          description = "Path to a systemd `EnvironmentFile` holding at least `IMPORT_API_KEY=…`.";
-        };
-
-        jobs = lib.mkOption {
-          type = lib.types.attrsOf jobModule;
-          default = { };
-          example = {
-            family = {
-              export_album_url = "https://their-immich.example.com/s/some-shared-album";
-              export_album_password_file = "%d/family-link-password";
-              import_server_url = "https://immich.example.com";
-              import_api_key_file = "%d/immich-api-key";
-              import_album = "Family Photos";
-            };
-            hiking = {
-              export_album_url = "https://their-other-immich.example.com/s/some-shared-album";
-              import_server_url = "https://immich.example.com";
-              import_api_key_file = "%d/immich-api-key";
-              import_album = "Family Photos"; # same album as `family`, deliberately
-              interval = "12h"; # slow server, don't hammer it
-            };
-          };
           description = ''
-            Jobs to run, keyed by a name that only ever shows up in logs. Set at least one to
-            render a config file at all; with `jobs` empty (the default), the service runs on
-            {option}`services.${name}.settings` alone, exactly as before.
-
-            There is no Nix-level equivalent of the config format's top-level default-for-
-            every-job keys -- share values between jobs with ordinary Nix (a `let`-bound
-            attrset merged into each job), the same way you would share any other option.
-
-            Any job missing a required key (`export_album_url`, `import_server_url`, an API
-            key, or `import_album`, after its own settings) fails at startup with an error
-            naming the job and the key; this module does not duplicate that check.
+            Path to a systemd `EnvironmentFile`. Holds the variables named by any
+            `_env` secret key in {option}`services.${name}.settings`.
           '';
         };
       };
 
       config = lib.mkIf cfg.enable {
+        assertions = [
+          {
+            assertion = cfg.settings.jobs != { };
+            message = "services.${name}.settings.jobs is empty: define at least one job to run.";
+          }
+        ]
+        ++ map (key: {
+          assertion = secretSpellings cfg.settings key <= 1;
+          message =
+            "services.${name}.settings sets ${key} more than once — use only one of ${key}, "
+            + "${key}_file or ${key}_env.";
+        }) secretKeys
+        ++ lib.concatLists (lib.mapAttrsToList jobAssertions cfg.settings.jobs);
+
         warnings =
-          lib.optional
-            (cfg.settings ? IMPORT_API_KEY || cfg.settings ? EXPORT_ALBUM_PASSWORD || jobHasInlineSecret)
-            "services.${name}.settings or .jobs.<name> contains an inline secret, which puts it in the world-readable Nix store. Use services.${name}.jobs.<name>.import_api_key_file/_env and .export_album_password_file/_env, or services.${name}.environmentFile, instead.";
+          let
+            inlineIn = table: lib.any (key: table.${key} != null) secretKeys;
+          in
+          lib.optional (inlineIn cfg.settings || lib.any inlineIn (lib.attrValues cfg.settings.jobs))
+            "services.${name}.settings contains an inline secret, which puts it in the world-readable Nix store. Use the _file or _env spelling of that key instead.";
 
         systemd.services.${name} = {
           description = "Mirror a shared Immich album into a local album";
@@ -201,11 +256,7 @@ in
           after = [ "network-online.target" ];
           wants = [ "network-online.target" ];
 
-          environment = {
-            CACHE_DIR = "/var/cache/${name}";
-          }
-          // lib.optionalAttrs hasJobs { CONFIG_FILE = "${configFile}"; }
-          // lib.mapAttrs (lib.const toEnvValue) cfg.settings;
+          environment.CONFIG_FILE = "${configFile}";
 
           serviceConfig = {
             ExecStart = lib.getExe cfg.package;
@@ -218,9 +269,9 @@ in
             RestartSec = 60;
 
             # Each in-flight transfer stages one asset at full size before re-uploading it, so
-            # PrivateTmp (implied by DynamicUser) needs room for TRANSFER_CONCURRENCY times
-            # the largest single asset across every job, not the album total. Point TMPDIR
-            # elsewhere via `settings` if /tmp is a small tmpfs.
+            # PrivateTmp (implied by DynamicUser) needs room for transfer_concurrency times
+            # the largest single asset across every job, not the album total. Point
+            # `settings.tmp_dir` elsewhere if /tmp is a small tmpfs.
 
             AmbientCapabilities = [ "" ];
             CapabilityBoundingSet = [ "" ];
