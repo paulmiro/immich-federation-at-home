@@ -24,7 +24,7 @@ use url::Url;
 use crate::retry::{self, RetryPolicy, Retryable};
 use crate::{debug, trace};
 
-/// This tool's `User-Agent`, e.g. `immich-federation-at-home/0.1.0`.
+/// This tool's `User-Agent`, e.g. `immich-federation-at-home/0.2.0`.
 pub const USER_AGENT: &str = concat!(env!("CARGO_PKG_NAME"), "/", env!("CARGO_PKG_VERSION"));
 
 /// Builds a `reqwest::Client` with `timeout` applied to every request it makes and this
