@@ -260,8 +260,11 @@ supported way to merge several source albums into one.
 that needs to be gentle with a slow export server uses a longer `interval` instead.
 
 **Failure isolation.** One job failing its startup checks (an expired share link, say)
-doesn't stop the others — it's retried on that job's next tick. With `RUN_ONCE`, every job
-runs once and the process exits non-zero if any job failed.
+doesn't stop the others — it's retried on that job's next tick. The one exception: if
+*every* job fails its very first attempt, the process exits non-zero at startup instead of
+looping forever with nothing working (this is also what a single job with no config file
+does today, unchanged). With `RUN_ONCE`, every job runs once and the process exits non-zero
+if any job failed.
 
 ## What gets synced
 

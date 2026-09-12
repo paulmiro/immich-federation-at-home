@@ -92,11 +92,13 @@ pub struct ContentHashCache {
 }
 
 impl ContentHashCache {
-    /// Disabled — every lookup misses, every insert is kept in memory for this process
-    /// only, and [`persist`](Self::persist) does nothing. This is what an unset
-    /// `CACHE_DIR` produces: a fresh `cargo run` must never fail because of an unwritable
-    /// default, so "no cache configured" has to be representable as a value rather than an
-    /// error.
+    /// Disabled — [`get`](Self::get)/[`insert`](Self::insert) still work as an ordinary
+    /// in-memory map for this process's own lifetime (so a single run's own downloads still
+    /// dedupe against each other), but nothing is ever loaded from or written to disk:
+    /// [`persist`](Self::persist) does nothing, and nothing survives past this process. This
+    /// is what an unset `CACHE_DIR` produces: a fresh `cargo run` must never fail because of
+    /// an unwritable default, so "no cache configured" has to be representable as a value
+    /// rather than an error.
     pub fn disabled() -> Self {
         Self {
             dir: None,

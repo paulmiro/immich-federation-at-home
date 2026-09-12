@@ -144,11 +144,15 @@ async fn main() -> ExitCode {
     // Config parsing, precedence, inheritance, secrets, and validation all happen inside
     // `load` — see `config.rs`. The configured log level isn't in effect yet at this point,
     // so a failure here is reported the same way clap's own parse errors already are:
-    // straight to stderr, no log formatting.
+    // straight to stderr, no log formatting. `format_error_chain` (not bare `{err}`) is what
+    // actually surfaces the failure: several of `load`'s own error paths (an unknown TOML
+    // key, for one) carry the actionable detail — which key, which job — only in the
+    // wrapped-`Context`'s source, not in the top-level message `{err}`'s `Display` alone
+    // would print.
     let settings = match resolve_settings(&matches) {
         Ok(settings) => settings,
         Err(err) => {
-            eprintln!("Error: {err}");
+            eprintln!("Error: {}", format_error_chain(&err));
             return ExitCode::FAILURE;
         }
     };
