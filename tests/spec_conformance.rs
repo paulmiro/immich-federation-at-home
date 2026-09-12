@@ -25,8 +25,7 @@ use std::sync::LazyLock;
 use immich_federation_at_home::immich::dto;
 
 static SPEC: LazyLock<serde_json::Value> = LazyLock::new(|| {
-    let path =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi/immich-openapi.json");
+    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("openapi/immich-openapi.json");
     let raw = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read vendored spec at {}: {e}", path.display()));
     serde_json::from_str(&raw).expect("vendored spec must be valid JSON")
