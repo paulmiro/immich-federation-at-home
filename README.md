@@ -42,12 +42,12 @@ services:
       # UUID or exact name of an *existing* album on your instance.
       IMPORT_ALBUM: "Family Photos"
 
-      IMPORT_INTERVAL: "1h"
-      IMPORT_CONCURRENCY: "4"
+      INTERVAL: "1h"
+      TRANSFER_CONCURRENCY: "4"
       LOG_LEVEL: "info"
     tmpfs:
-      # Assets are staged here one at a time, so size this for the largest single asset in
-      # the album, not the album total. Drop it to stage on disk instead.
+      # Assets are staged here TRANSFER_CONCURRENCY at a time, so size this for that many
+      # times the largest single asset, not the album total. Drop it to stage on disk instead.
       - /tmp:size=8g
     volumes:
       # Strongly recommended. Without it the cache is discarded every time the container is
@@ -59,6 +59,60 @@ services:
 volumes:
   cache:
 ```
+
+### Multiple jobs
+
+Point `CONFIG_FILE` at a mounted config file instead of the per-job variables above. A
+top-level `configs:` block with inline `content:` keeps everything in one `compose.yaml`,
+but needs Compose ≥ 2.23:
+
+```yaml
+configs:
+  jobs:
+    content: |
+      import_server_url  = "https://immich.example.com"
+      import_api_key_env = "IMPORT_API_KEY"
+
+      [jobs.family]
+      export_album_url = "https://their-immich.example.com/s/some-shared-album"
+      import_album     = "Family Photos"
+
+services:
+  immich-federation-at-home:
+    image: ghcr.io/paulmiro/immich-federation-at-home:latest
+    restart: unless-stopped
+    configs:
+      - source: jobs
+        target: /config.toml
+    environment:
+      CONFIG_FILE: /config.toml
+      IMPORT_API_KEY: "..."   # referenced from the file via import_api_key_env
+    tmpfs:
+      # TRANSFER_CONCURRENCY times the largest single asset, across every job.
+      - /tmp:size=8g
+    volumes:
+      - cache:/cache
+
+volumes:
+  cache:
+```
+
+Below Compose 2.23, use `CONFIG` with a YAML block scalar instead of `configs:`:
+
+```yaml
+    environment:
+      CONFIG: |
+        import_server_url  = "https://immich.example.com"
+        import_api_key_env = "IMPORT_API_KEY"
+
+        [jobs.family]
+        export_album_url = "https://their-immich.example.com/s/some-shared-album"
+        import_album     = "Family Photos"
+      IMPORT_API_KEY: "..."
+```
+
+See [Running several jobs in one process](#running-several-jobs-in-one-process) for the
+full config format, including secrets and precedence.
 
 ## NixOS module
 
@@ -74,7 +128,7 @@ volumes:
       EXPORT_ALBUM_URL = "https://photos.friend.example/share/AbC123";
       IMPORT_SERVER_URL = "https://immich.example.com";
       IMPORT_ALBUM = "Family Photos";
-      IMPORT_INTERVAL = "1h";
+      INTERVAL = "1h";
     };
 
     # IMPORT_API_KEY=… and, if the share link has one, EXPORT_ALBUM_PASSWORD=….
@@ -82,6 +136,10 @@ volumes:
   };
 }
 ```
+
+For several jobs, or a secret read from a file instead of an environment file, set
+`services.immich-federation-at-home.jobs.<name>` instead — see that option's own
+description for the full per-job key list.
 
 ## Running the binary directly
 
@@ -113,24 +171,97 @@ Prefer a timer? Set `RUN_ONCE=true`, make the unit `Type=oneshot`, and drive it 
 
 ## Environment variables
 
-Every variable has an equivalent `--kebab-case-flag` that has priority over the environment variable.
-Variables with no Default value (-) are required.
+Every variable has an equivalent `--kebab-case-flag` that has priority over the environment
+variable, with two exceptions: `CONFIG_FILE`'s flag is `--config`, and `CONFIG` (inline TOML)
+has no flag at all — it exists for platforms that can only inject environment variables.
+Variables with no Default value (-) are required (after inheritance, if a config file is in
+play — see [Running several jobs in one process](#running-several-jobs-in-one-process)).
+
+Process-global — describe the process, not any one job:
+
+| Variable               | Default | Meaning                                                                                        |
+| ---------------------- | ------- | ---------------------------------------------------------------------------------------------- |
+| `LOG_LEVEL`            | `info`  | `error\|warn\|info\|debug\|trace`. `RUST_LOG` is not read.                                     |
+| `CACHE_DIR`            | unset   | Where to keep the content-hash cache. Startup fails if it is set but not writable.             |
+| `TMPDIR`               | system  | Where assets are staged while in flight. Needs room for `TRANSFER_CONCURRENCY` of them.        |
+| `TRANSFER_CONCURRENCY` | `4`     | How many assets are transferred in parallel, across every job in the process.                  |
+| `CONFIG_FILE`          | unset   | Path to a TOML config file. Mutually exclusive with `CONFIG`.                                  |
+| `CONFIG`               | unset   | The TOML config inline, for environment-only platforms. Mutually exclusive with `CONFIG_FILE`. |
+
+Per-job — used directly when there is no config file, describing the single implicit job;
+inside a config file the same keys, lowercased, go in a `[jobs.<name>]` table or at the top
+level as a default for every job:
 
 | Variable                | Default | Meaning                                                                                 |
-| ----------------------- | ------- | --------------------------------------------------------------------------------------- |
+| ----------------------- | ------- | ---------------------------------------------------------------------------------------- |
 | `EXPORT_ALBUM_URL`      | -       | Share link for the album to mirror. Sub-path deployments and trailing slashes are fine. |
 | `EXPORT_ALBUM_PASSWORD` | unset   | Password for the share link, if it has one.                                             |
 | `IMPORT_SERVER_URL`     | -       | Your own instance, e.g. `https://immich.example.com`. A trailing `/` or `/api` is fine. |
 | `IMPORT_API_KEY`        | -       | API key for the import instance; see [Setup](#setup).                                   |
 | `IMPORT_ALBUM`          | -       | Target album: a UUID, or an exact album name. It must already exist.                    |
-| `IMPORT_INTERVAL`       | `1h`    | How often to check for new assets (`30m`, `1h30m`, `6h`, …).                            |
-| `LOG_LEVEL`             | `info`  | `error\|warn\|info\|debug\|trace`. `RUST_LOG` is not read.                              |
-| `IMPORT_CONCURRENCY`    | `4`     | How many assets are transferred in parallel.                                            |
+| `INTERVAL`              | `1h`    | How often to check for new assets (`30m`, `1h30m`, `6h`, …).                            |
 | `REQUEST_TIMEOUT`       | `30s`   | Timeout for metadata calls.                                                             |
 | `TRANSFER_TIMEOUT`      | `30m`   | Timeout for transferring a single asset.                                                |
-| `RUN_ONCE`              | `false` | Do one sync pass and exit. Only the literal `true`/`false`, not `1`/`0`.                |
-| `TMPDIR`                | system  | Where assets are staged while in flight. Needs room for the largest single asset.       |
-| `CACHE_DIR`             | unset   | Where to keep the content-hash cache. Startup fails if it is set but not writable.      |
+
+`RUN_ONCE`/`--once` (`true`/`false` only, default `false`) does one pass over every job and
+exits, non-zero if any job failed. It's an invocation mode for the whole process, not a
+config-file key — it applies even when `--config` is set.
+
+## Running several jobs in one process
+
+With no `--config` / `CONFIG_FILE` / `CONFIG`, the environment variables above describe
+exactly one job, named `default` in the logs — today's behaviour, unchanged. Every existing
+deployment keeps working untouched.
+
+Point one at a config file to run more than one job. `--config` / `CONFIG_FILE` takes a
+path; `CONFIG` takes the TOML inline, for platforms that can only inject environment
+variables (older Compose, Portainer, Kubernetes). Setting both is a startup error. There is
+no implicit config path — no file, one job, always.
+
+Once a config file is in play, **it is the whole job list**: the per-job environment
+variables stop reaching into jobs entirely (the process-global ones still apply, see
+precedence below). Jobs live in `[jobs.<name>]` tables; any job key set at the top level
+becomes the default for every job that doesn't set its own. Job names only ever show up in
+logs.
+
+```toml
+transfer_concurrency = 4
+
+# Defaults for every job below.
+import_server_url   = "https://my-immich.example.com"
+import_api_key_file = "/run/secrets/immich-api-key"
+interval            = "1h"
+
+[jobs.family]
+export_album_url           = "https://their-immich.example.com/s/some-shared-album"
+export_album_password_file = "/run/secrets/family-link-password"
+import_album               = "Family Photos"
+
+[jobs.hiking]
+export_album_url = "https://their-other-immich.example.com/s/some-shared-album"
+interval         = "12h"           # slow server, don't hammer it
+import_album     = "Family Photos" # same album as `family`, deliberately
+```
+
+**Precedence.** Process-global keys: flag > file > env > default. Job keys: job table >
+top-level default > built-in default — environment variables never reach into jobs once a
+file exists.
+
+**Secrets.** `import_api_key` and `export_album_password` each also accept a `*_file`
+variant (a path, read at startup) and a `*_env` variant (the name of an environment
+variable, read at startup) — exactly one spelling per key per job. `*_file` is what makes
+Docker secrets, systemd `LoadCredential`, sops-nix and agenix work. Startup warns if a
+config file holding an inline secret is group- or world-readable.
+
+**Merging albums.** Two jobs may deliberately target the same `import_album` — that's the
+supported way to merge several source albums into one.
+
+**Concurrency.** `transfer_concurrency` is process-wide; there is no per-job knob. A job
+that needs to be gentle with a slow export server uses a longer `interval` instead.
+
+**Failure isolation.** One job failing its startup checks (an expired share link, say)
+doesn't stop the others — it's retried on that job's next tick. With `RUN_ONCE`, every job
+runs once and the process exits non-zero if any job failed.
 
 ## What gets synced
 
