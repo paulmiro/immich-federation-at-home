@@ -42,10 +42,17 @@ pub enum Outcome {
 ///
 /// Two pieces of state serve two different needs: [`Self::is_triggered`] is a synchronous,
 /// non-blocking check (used right after a run finishes, before deciding whether to sleep or
-/// exit), while [`Self::wait`] is an async wait woken immediately by [`Self::trigger`] (used
-/// to cut the between-runs sleep short instead of polling). Checking the flag first inside
-/// [`Self::wait`] — rather than relying solely on [`Notify`]'s own "buffered wakeup" — means
-/// it's safe to call `wait` even after `trigger` already happened.
+/// exit), while [`Self::wait`] is an async wait woken by [`Self::trigger`] (used to cut the
+/// between-runs sleep short instead of polling, across every one of the n job loops parked
+/// in it at once). [`Self::trigger`] wakes them with [`Notify::notify_waiters`] rather than
+/// `notify_one` specifically so that *all* of them wake together instead of one at a time.
+///
+/// `notify_waiters`, unlike `notify_one`, buffers nothing for a waiter that starts *after*
+/// the notification — it only wakes tasks already parked in `notified()` at the moment it's
+/// called. That makes the flag check inside [`Self::wait`] load-bearing, not
+/// belt-and-braces: without it, a job whose `wait()` call lands after `trigger()` already ran
+/// (routine, since jobs run on independent schedules) would await a notification that will
+/// never come.
 pub struct ShutdownSignal {
     triggered: AtomicBool,
     notify: Notify,
@@ -59,13 +66,15 @@ impl ShutdownSignal {
         }
     }
 
-    /// Marks the signal triggered and wakes anyone currently in [`Self::wait`]. Idempotent:
-    /// a second call is a harmless no-op as far as this type's own state is concerned (it's
-    /// `main.rs`'s job to treat a *second* incoming OS signal specially — an immediate
-    /// process exit — which has nothing to do with this type).
+    /// Marks the signal triggered and wakes *every* task currently parked in [`Self::wait`]
+    /// (via [`Notify::notify_waiters`] — plural, not `notify_one`, since with n job loops all
+    /// of them may be sleeping between runs and all of them need to notice at once, not one
+    /// per interval). Idempotent: a second call is a harmless no-op as far as this type's own
+    /// state is concerned (it's `main.rs`'s job to treat a *second* incoming OS signal
+    /// specially — an immediate process exit — which has nothing to do with this type).
     pub fn trigger(&self) {
         self.triggered.store(true, Ordering::SeqCst);
-        self.notify.notify_one();
+        self.notify.notify_waiters();
     }
 
     pub fn is_triggered(&self) -> bool {
@@ -73,6 +82,10 @@ impl ShutdownSignal {
     }
 
     /// Resolves as soon as [`Self::trigger`] has been (or is concurrently being) called.
+    ///
+    /// The flag check has to come first: [`Self::trigger`] notifies via `notify_waiters`,
+    /// which does not buffer a wakeup for a `wait` that starts after the trigger already
+    /// fired — see this type's doc comment.
     async fn wait(&self) {
         if self.is_triggered() {
             return;
@@ -357,5 +370,40 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
             .await
             .expect("wait() must wake up once trigger() is called");
+    }
+
+    /// The regression test for `notify_one` -> `notify_waiters`: with n job loops all parked
+    /// in `wait()` between runs, a single `trigger()` must wake all of them, not just one.
+    #[tokio::test]
+    async fn trigger_wakes_every_concurrent_waiter_not_just_one() {
+        const N: u32 = 3;
+        let shutdown = Arc::new(ShutdownSignal::new());
+        let parked = Arc::new(AtomicU32::new(0));
+        let mut waiters = tokio::task::JoinSet::new();
+
+        for _ in 0..N {
+            let shutdown = shutdown.clone();
+            let parked = parked.clone();
+            waiters.spawn(async move {
+                parked.fetch_add(1, Ordering::SeqCst);
+                tokio::time::timeout(Duration::from_secs(5), shutdown.wait())
+                    .await
+                    .expect("every waiter must be woken by a single trigger, not just one");
+            });
+        }
+
+        // Single-threaded test runtime: yielding here lets the scheduler run every spawned
+        // task up to its first pending await (inside `wait()`, registering with `Notify`)
+        // before this task calls `trigger`, the same way the interval tests above rely on
+        // `yield_now` to observe the first run having started.
+        while parked.load(Ordering::SeqCst) < N {
+            tokio::task::yield_now().await;
+        }
+
+        shutdown.trigger();
+
+        while let Some(result) = waiters.join_next().await {
+            result.unwrap();
+        }
     }
 }
