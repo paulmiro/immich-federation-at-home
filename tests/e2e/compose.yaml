@@ -4,13 +4,13 @@
 #
 # Service configuration, image names and required environment are copied from Immich's own
 # published `docker/docker-compose.yml` and `docker/example.env`
-# (https://github.com/immich-app/immich/blob/v3.1.0/docker/docker-compose.yml), not invented —
+# (https://github.com/immich-app/immich/blob/v3.2.0/docker/docker-compose.yml), not invented —
 # only the naming (container/volume/network names, ports) was changed, twice over, to run two
 # independent stacks side by side without colliding.
 #
-# Image tag v3.1.0 is pinned (not `:latest`) and satisfies PLAN.md's `>= 3.0.3` export-side
+# Image tag v3.2.0 is pinned (not `:latest`) and satisfies PLAN.md's `>= 3.0.3` export-side
 # floor (and the `>= 3.0.0` import-side floor) with room to spare — it's the exact version this
-# whole plan was written against (see PLAN.md's own header: "API version 3.1.0").
+# whole plan was written against (see PLAN.md's own header: "API version 3.2.0").
 #
 # Bring up: `docker compose -f tests/e2e/compose.yaml up -d --wait`
 # Tear down: `docker compose -f tests/e2e/compose.yaml down -v`
@@ -25,7 +25,7 @@ name: immich-federation-e2e
 services:
   export-server:
     container_name: immich-e2e-export-server
-    image: ghcr.io/immich-app/immich-server:v3.1.0
+    image: ghcr.io/immich-app/immich-server:v3.2.0
     environment:
       DB_HOSTNAME: export-database
       DB_USERNAME: postgres
@@ -79,7 +79,7 @@ services:
 
   import-server:
     container_name: immich-e2e-import-server
-    image: ghcr.io/immich-app/immich-server:v3.1.0
+    image: ghcr.io/immich-app/immich-server:v3.2.0
     environment:
       DB_HOSTNAME: import-database
       DB_USERNAME: postgres
