@@ -13,8 +13,11 @@
 //! function `main.rs` actually calls; everything else in this module is a smaller piece it
 //! composes, each independently unit tested below.
 
+use std::sync::Arc;
+
 use anyhow::Context;
 use chrono::{DateTime, Utc};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::cache::ContentHashCache;
@@ -268,10 +271,23 @@ pub struct StartupOutcome {
 /// propagated HTTP error) — see the individual step functions above for the exact wording.
 /// `Err` here is always fatal: `main.rs` logs it and exits non-zero, per §5's "the process
 /// exits non-zero on any failure".
-pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
+///
+/// `cache` and `transfers` are process-level resources (`scratch/JOBS-DESIGN.md`): the cache
+/// is opened once and shared by every job, and the transfer semaphore caps assets in flight
+/// across every job, so `main.rs` builds both before calling this rather than this function
+/// building its own.
+pub async fn run_startup(
+    config: &Config,
+    cache: Arc<ContentHashCache>,
+    transfers: Arc<Semaphore>,
+) -> anyhow::Result<StartupOutcome> {
     // Step 3 — parse EXPORT_ALBUM_URL.
     let (export_api_base, share_ref) = crate::share_url::parse_share_url(&config.export_album_url)
         .context("failed to parse EXPORT_ALBUM_URL")?;
+    // Captured now, before `export_api_base` moves into `ExportClient::new` below: this is
+    // the cache namespace key `scratch/JOBS-DESIGN.md` specifies (the normalized export API
+    // base URL, as an opaque string).
+    let export_instance = export_api_base.to_string();
 
     let retry_policy = RetryPolicy::default();
     let export = ExportClient::new(
@@ -345,24 +361,6 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
     // ids) are already exactly the actionable text §5 step 9 asks for — nothing to add.
     let target_album = import.resolve_album(&config.import_album_ref()).await?;
 
-    // The content-hash cache (`scratch/CACHE-DESIGN.md`). Built now, before `SyncContext`,
-    // so a misconfigured `CACHE_DIR` is a loud, immediate startup failure rather than a
-    // warning discovered only once the first run tries to save the cache: this is always
-    // user error (typically a root-owned bind mount) and must be caught here.
-    let cache = match &config.cache_dir {
-        Some(dir) => ContentHashCache::open(dir).with_context(|| {
-            format!(
-                "CACHE_DIR={} could not be created or written. If you are running the \
-                 container image, it runs as uid 65532, so a bind-mounted host directory \
-                 must be owned by that uid (chown 65532:65532 on the host) — a named Docker \
-                 volume avoids the problem entirely and is what the README recommends. \
-                 Unset CACHE_DIR to run without a cache instead.",
-                dir.display()
-            )
-        })?,
-        None => ContentHashCache::disabled(),
-    };
-
     // Step 10 — summary.
     let summary = StartupSummary {
         export_version,
@@ -385,10 +383,12 @@ pub async fn run_startup(config: &Config) -> anyhow::Result<StartupOutcome> {
         import,
         album_info.album_id,
         target_album.id,
+        export_instance,
         config.import_concurrency,
         config.transfer_timeout,
         retry_policy,
         cache,
+        transfers,
     );
 
     Ok(StartupOutcome { sync, summary })
@@ -650,7 +650,13 @@ mod tests {
         ])
         .unwrap();
 
-        let outcome = run_startup(&config).await.expect("startup should succeed");
+        let outcome = run_startup(
+            &config,
+            Arc::new(ContentHashCache::disabled()),
+            Arc::new(Semaphore::new(4)),
+        )
+        .await
+        .expect("startup should succeed");
 
         assert_eq!(outcome.summary.export_version, version(3, 1, 0));
         assert_eq!(outcome.summary.import_version, version(3, 1, 0));
@@ -700,7 +706,13 @@ mod tests {
         .unwrap();
 
         assert!(
-            run_startup(&config).await.is_err(),
+            run_startup(
+                &config,
+                Arc::new(ContentHashCache::disabled()),
+                Arc::new(Semaphore::new(4))
+            )
+            .await
+            .is_err(),
             "startup should have failed: the key only has asset.upload"
         );
     }

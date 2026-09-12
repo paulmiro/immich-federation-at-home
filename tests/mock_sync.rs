@@ -30,6 +30,7 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use clap::Parser;
 use serde_json::json;
 use sha1::{Digest, Sha1};
+use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use url::Url;
 use uuid::Uuid;
@@ -273,10 +274,12 @@ impl MockServer {
             self.import_client(),
             EXPORT_ALBUM_ID,
             IMPORT_ALBUM_ID,
+            self.export_base.to_string(),
             4,
             Duration::from_secs(10),
             RetryPolicy::zero_delay(),
-            ContentHashCache::disabled(),
+            Arc::new(ContentHashCache::disabled()),
+            Arc::new(Semaphore::new(4)),
         )
     }
 }
@@ -824,9 +827,13 @@ async fn run_startup_builds_a_working_sync_context() {
     ])
     .unwrap();
 
-    let outcome = run_startup(&config)
-        .await
-        .expect("startup should succeed against the mock");
+    let outcome = run_startup(
+        &config,
+        Arc::new(ContentHashCache::disabled()),
+        Arc::new(Semaphore::new(4)),
+    )
+    .await
+    .expect("startup should succeed against the mock");
     assert_eq!(outcome.summary.source_asset_count, 1);
     assert_eq!(outcome.summary.target_album_id, IMPORT_ALBUM_ID);
 

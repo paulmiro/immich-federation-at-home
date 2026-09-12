@@ -42,6 +42,7 @@
 //! ```
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use base64::Engine;
@@ -50,9 +51,11 @@ use clap::Parser;
 use reqwest::multipart;
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
+use tokio::sync::Semaphore;
 use url::Url;
 use uuid::Uuid;
 
+use immich_federation_at_home::cache::ContentHashCache;
 use immich_federation_at_home::config::Config;
 use immich_federation_at_home::startup::run_startup;
 
@@ -468,7 +471,9 @@ async fn mirrors_an_album_end_to_end() {
         .validate()
         .expect("Config should pass semantic validation");
 
-    let outcome = run_startup(&config)
+    let cache = Arc::new(ContentHashCache::disabled());
+    let transfers = Arc::new(Semaphore::new(4));
+    let outcome = run_startup(&config, cache, transfers)
         .await
         .expect("run_startup should succeed against two freshly-provisioned real instances");
     assert_eq!(outcome.summary.source_asset_count, fixtures.len() as u64);

@@ -14,7 +14,9 @@ use std::sync::Arc;
 
 use clap::Parser;
 use tokio::signal::unix::{SignalKind, signal};
+use tokio::sync::Semaphore;
 
+use immich_federation_at_home::cache::ContentHashCache;
 use immich_federation_at_home::config::Config;
 use immich_federation_at_home::scheduler::{self, ShutdownSignal};
 use immich_federation_at_home::{error, format_error_chain, info, log, startup, warn};
@@ -35,10 +37,45 @@ async fn main() -> ExitCode {
     // PLAN.md §5 step 2.
     log::set_level(config.log_level);
 
+    // The content-hash cache (`scratch/CACHE-DESIGN.md`) and the process-wide transfer
+    // semaphore (`scratch/JOBS-DESIGN.md`'s "Global transfer cap") are both process-level
+    // resources, opened once here rather than inside `run_startup`, so a future multi-job
+    // `main.rs` can share one of each across every job's `SyncContext` instead of building a
+    // cache or a cap per job. Built before `run_startup` so a misconfigured `CACHE_DIR` is a
+    // loud, immediate startup failure rather than a warning discovered only once the first
+    // run tries to save the cache: this is always user error (typically a root-owned bind
+    // mount) and must be caught here.
+    let cache = match &config.cache_dir {
+        Some(dir) => match ContentHashCache::open(dir) {
+            Ok(cache) => cache,
+            Err(err) => {
+                let err = err.context(format!(
+                    "CACHE_DIR={} could not be created or written. If you are running the \
+                     container image, it runs as uid 65532, so a bind-mounted host directory \
+                     must be owned by that uid (chown 65532:65532 on the host) — a named \
+                     Docker volume avoids the problem entirely and is what the README \
+                     recommends. Unset CACHE_DIR to run without a cache instead.",
+                    dir.display()
+                ));
+                error!("{}", format_error_chain(&err));
+                return ExitCode::FAILURE;
+            }
+        },
+        None => ContentHashCache::disabled(),
+    };
+    let cache = Arc::new(cache);
+    // `Config::validate` (above) already rejects 0; `.max(1)` is cheap insurance against a
+    // `Semaphore::new(0)` that would never let any transfer through.
+    let transfers = Arc::new(Semaphore::new(
+        usize::try_from(config.import_concurrency)
+            .unwrap_or(usize::MAX)
+            .max(1),
+    ));
+
     // PLAN.md §5 steps 3-10. Sample output (both success and failure) is in this task's
     // report; every failure here is actionable prose naming the env var or the remote-side
     // setting to fix, never a bare propagated HTTP error — see `startup.rs`.
-    let outcome = match startup::run_startup(&config).await {
+    let outcome = match startup::run_startup(&config, cache, transfers).await {
         Ok(outcome) => outcome,
         Err(err) => {
             error!("{}", format_error_chain(&err));

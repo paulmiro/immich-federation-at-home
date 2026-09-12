@@ -15,12 +15,14 @@
 //!   is logged, counted, and does not stop the run; step 1 or 2 failing aborts the run (an
 //!   `Err` from [`SyncContext::run_once`]) but not the process — the next tick retries.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use futures_util::stream::{self, StreamExt};
 use tempfile::{Builder as TempFileBuilder, NamedTempFile, TempPath};
+use tokio::sync::Semaphore;
 use tokio::task::spawn_blocking;
 use uuid::Uuid;
 
@@ -73,9 +75,20 @@ pub struct SyncContext {
     export_album_id: Uuid,
     /// The resolved `IMPORT_ALBUM` target — what I6 adds to every run.
     import_album_id: Uuid,
-    /// `IMPORT_CONCURRENCY`, clamped to at least 1 (`Config::validate` already rejects 0,
+    /// The export API base URL (`share_url::parse_share_url`'s first return value), used
+    /// verbatim as the namespace key for every [`ContentHashCache`] call this context makes
+    /// (`scratch/JOBS-DESIGN.md`'s "Cache, file format v2"). Opaque to this module — never
+    /// reparsed or validated, just threaded through.
+    export_instance: String,
+    /// `transfer_concurrency`, clamped to at least 1 (`Config::validate` already rejects 0,
     /// but a stray 0 here would make `buffer_unordered` never poll anything — cheap
-    /// insurance against that footgun).
+    /// insurance against that footgun). This bounds only *this job's* `buffer_unordered`
+    /// polling window in [`Self::run_once`] — how many of its own transfer futures are
+    /// being driven at once — which is a separate concern from `transfers` below, the
+    /// process-wide semaphore that enforces the real cap on assets in flight across every
+    /// job. Both are sized from the same global `transfer_concurrency` value, but this field
+    /// only saves a job with few assets from polling pointlessly wide; `transfers` is what
+    /// the disk/tmpfs sizing advice in `README.md` is actually written against.
     concurrency: usize,
     /// `TRANSFER_TIMEOUT` (`PLAN.md` §4): bounds one asset's *whole* step-3 span (temp file
     /// creation, download, checksum, and upload, including upload's own internal retries).
@@ -87,39 +100,49 @@ pub struct SyncContext {
     /// writer); this is what lets [`SyncContext::download_with_retry`] retry it safely from
     /// here, opening a clean temp file per attempt.
     download_retry_policy: RetryPolicy,
-    /// The path-hash → content-hash cache (`scratch/CACHE-DESIGN.md`). A plain field, not an
-    /// `Arc`: every [`ContentHashCache`] method takes `&self`, and the transfer futures in
-    /// [`Self::run_once`] only ever borrow `&self` (this whole `SyncContext`), never move out
-    /// of it, so there is nothing an `Arc` would buy here.
-    cache: ContentHashCache,
+    /// The path-hash → content-hash cache (`scratch/CACHE-DESIGN.md`, file format v2 per
+    /// `scratch/JOBS-DESIGN.md`). An `Arc`: the cache is opened once per process (`main.rs`)
+    /// and shared by every job's `SyncContext`, since a cache entry keyed by export instance
+    /// is exactly the thing two jobs mirroring the same friend's server should share.
+    cache: Arc<ContentHashCache>,
+    /// The process-wide transfer cap (`scratch/JOBS-DESIGN.md`'s "Global transfer cap"),
+    /// acquired around each asset's whole step-3 span in [`Self::transfer_one`]. Unlike
+    /// `concurrency` above, this is shared across every job in the process — it is the
+    /// thing that actually bounds how many assets are staged in `TMPDIR` at once, which is
+    /// what the README's tmpfs sizing advice is written against.
+    transfers: Arc<Semaphore>,
 }
 
 impl SyncContext {
-    /// 8 constructor arguments rather than a builder or params struct: every field is a
+    /// 10 constructor arguments rather than a builder or params struct: every field is a
     /// distinct, already-well-named piece of startup state (see each field's own doc comment
-    /// above) built exactly once (`startup.rs::run_startup`) and once more in this module's
-    /// own tests — there is no repeated or optional-subset call site that a builder would pay
-    /// for itself against.
+    /// above) built exactly once per job (`startup.rs::run_startup`) and once more in this
+    /// module's own tests — there is no repeated or optional-subset call site that a builder
+    /// would pay for itself against.
     #[allow(clippy::too_many_arguments)]
     pub fn new(
         export: ExportClient,
         import: ImportClient,
         export_album_id: Uuid,
         import_album_id: Uuid,
+        export_instance: String,
         concurrency: u32,
         transfer_timeout: Duration,
         download_retry_policy: RetryPolicy,
-        cache: ContentHashCache,
+        cache: Arc<ContentHashCache>,
+        transfers: Arc<Semaphore>,
     ) -> Self {
         Self {
             export,
             import,
             export_album_id,
             import_album_id,
+            export_instance,
             concurrency: usize::try_from(concurrency).unwrap_or(usize::MAX).max(1),
             transfer_timeout,
             download_retry_policy,
             cache,
+            transfers,
         }
     }
 
@@ -203,11 +226,14 @@ impl SyncContext {
         let failed_count = counts.failed + album_failed_count;
 
         // ---- persist the content-hash cache --------------------------------------------
-        // Only reached once the album listing (step 1) has succeeded, which is exactly the
-        // condition `scratch/CACHE-DESIGN.md` requires before pruning. A failure here is
-        // logged, not propagated: the run's real work is already done, and the cache is
-        // disposable (losing it only costs a future re-download, never correctness).
-        if let Err(err) = self.cache.persist(&cohorts.path_hash_keep) {
+        // TTL-based pruning (`scratch/JOBS-DESIGN.md`) means this no longer needs to
+        // coincide with anything about this run in particular: unlike the old keep-set
+        // prune, a lost race against another job's own persist costs nothing, since every
+        // persist writes the whole in-memory map regardless of which job triggered it. A
+        // failure here is logged, not propagated: the run's real work is already done, and
+        // the cache is disposable (losing it only costs a future re-download, never
+        // correctness).
+        if let Err(err) = self.cache.persist() {
             error!(
                 "failed to persist the content-hash cache: {}",
                 format_error_chain(&err)
@@ -284,7 +310,6 @@ impl SyncContext {
     /// should use), and path-hashed cache misses (checked individually in step 3, after their
     /// own download, since their real content hash isn't known yet).
     fn partition_cohorts(&self, source_assets: Vec<SourceAsset>) -> Cohorts {
-        let mut path_hash_keep: HashSet<String> = HashSet::new();
         let mut check_candidates: Vec<CheckCandidate> = Vec::new();
         let mut misses: Vec<SourceAsset> = Vec::new();
         let mut cache_hits: usize = 0;
@@ -296,8 +321,10 @@ impl SyncContext {
                 continue;
             }
 
-            path_hash_keep.insert(asset.checksum.clone());
-            if let Some(content_checksum) = self.cache.get(&asset.checksum, asset.modified) {
+            if let Some(content_checksum) =
+                self.cache
+                    .get(&self.export_instance, &asset.checksum, asset.modified)
+            {
                 debug!(
                     "content-hash cache hit filename={} checksum={} export_id={}",
                     asset.filename, asset.checksum, asset.id
@@ -319,7 +346,6 @@ impl SyncContext {
         Cohorts {
             check_candidates,
             misses,
-            path_hash_keep,
             cache_hits,
         }
     }
@@ -463,6 +489,27 @@ impl SyncContext {
     /// itself. Wrapping the whole thing here is what actually enforces the PLAN.md §4
     /// contract ("Timeout for downloading and re-uploading a single asset").
     async fn transfer_one(&self, item: PlannedTransfer) -> TransferOutcome {
+        // The process-wide transfer permit is acquired *before* starting the
+        // `TRANSFER_TIMEOUT` clock, not inside it. `transfers` exists to cap how many assets
+        // are staged in `TMPDIR` at once across every job, not to cap how long one asset is
+        // allowed to queue behind others — if the wait counted against the budget, an asset
+        // could time out purely for having been scheduled behind other jobs' assets, before
+        // any of its own step-3 work even started. Moving the `acquire().await` inside the
+        // `timeout` below would look like a harmless simplification but would reintroduce
+        // exactly that bug.
+        let _permit = match self.transfers.acquire().await {
+            Ok(permit) => permit,
+            Err(_closed) => {
+                // Only possible if every `Arc<Semaphore>` clone were dropped, which never
+                // happens while a `SyncContext` (and therefore this method) is callable.
+                error!(
+                    "transfer semaphore closed unexpectedly; skipping {}",
+                    item.asset
+                );
+                return TransferOutcome::Failed;
+            }
+        };
+
         match tokio::time::timeout(self.transfer_timeout, self.transfer_one_inner(&item)).await {
             Ok(outcome) => outcome,
             Err(_elapsed) => {
@@ -549,6 +596,7 @@ impl SyncContext {
         // cache. A no-op when the cache is disabled.
         if asset.checksum_is_path_hash() {
             self.cache.insert(
+                &self.export_instance,
                 asset.checksum.clone(),
                 asset.modified,
                 download_outcome.checksum_sha1_base64.clone(),
@@ -746,9 +794,6 @@ struct Cohorts {
     check_candidates: Vec<CheckCandidate>,
     /// Path-hashed cache misses — checked individually in step 3, after their own download.
     misses: Vec<SourceAsset>,
-    /// Every path-hashed asset's own checksum seen this run, hit or miss alike — what the
-    /// end-of-run cache prune keeps.
-    path_hash_keep: HashSet<String>,
     /// How many of `check_candidates` were path-hashed cache hits.
     cache_hits: usize,
 }
@@ -1157,12 +1202,19 @@ mod tests {
             import_client(import_base),
             Uuid::from_u128(0x5111_0000_0000_0000_0000_0000_0000_0000),
             import_album_id,
+            TEST_EXPORT_INSTANCE.to_owned(),
             4,
             Duration::from_secs(10),
             RetryPolicy::zero_delay(),
-            cache,
+            Arc::new(cache),
+            Arc::new(Semaphore::new(4)),
         )
     }
+
+    /// The export instance key every test context is built with — arbitrary, but fixed, so
+    /// tests that pre-seed a cache entry directly (rather than via a prior `run_once`) know
+    /// exactly which namespace to write into.
+    const TEST_EXPORT_INSTANCE: &str = "https://export.example.com/api";
 
     const ALBUM_ID: Uuid = Uuid::from_u128(0x9999_0000_0000_0000_0000_0000_0000_0000);
 
@@ -1447,7 +1499,7 @@ mod tests {
         // fixture advertises) must be what got cached.
         let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
         assert_eq!(
-            reopened.get(&fx.checksum, default_modified()),
+            reopened.get(TEST_EXPORT_INSTANCE, &fx.checksum, default_modified()),
             Some(content_checksum(contents))
         );
     }
@@ -1530,7 +1582,7 @@ mod tests {
 
         let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
         assert_eq!(
-            reopened.get(&fx.checksum, default_modified()),
+            reopened.get(TEST_EXPORT_INSTANCE, &fx.checksum, default_modified()),
             Some(content_checksum(contents)),
             "the content hash must be learned even though the asset wasn't uploaded"
         );
@@ -1551,6 +1603,7 @@ mod tests {
         // The cache already has an entry for this path hash, but at the *old* modified
         // timestamp — stale now that the fixture's fileModifiedAt has moved on.
         cache.insert(
+            TEST_EXPORT_INSTANCE,
             fx.checksum.clone(),
             default_modified(),
             content_checksum(b"the old content, before it changed"),
@@ -1570,7 +1623,7 @@ mod tests {
         let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
         let new_modified_parsed: DateTime<Utc> = new_modified.parse().unwrap();
         assert_eq!(
-            reopened.get(&fx.checksum, new_modified_parsed),
+            reopened.get(TEST_EXPORT_INSTANCE, &fx.checksum, new_modified_parsed),
             Some(content_checksum(contents)),
             "the cache must be updated with the fresh content hash and timestamp"
         );
@@ -1595,5 +1648,67 @@ mod tests {
         assert_eq!(summary.failed, 1);
         assert_eq!(summary.cache_hits, 0);
         assert_eq!(state.lock().unwrap().upload_calls, 0);
+    }
+
+    // ---- the cache never decides whether work happens (`scratch/JOBS-DESIGN.md`) -----------
+
+    /// Regression test for the invariant `scratch/JOBS-DESIGN.md` calls out by name: a cache
+    /// hit must never short-circuit step 4. Here the cache is warmed directly (as if some
+    /// *other* job against the same export instance had already downloaded this asset), and
+    /// the import instance already has the resulting content hash too (as if that other job
+    /// had already uploaded it). The asset must still flow through the up-front
+    /// bulk-upload-check, classify as an ordinary duplicate, and land in `album_targets` —
+    /// exactly as any other already-present asset would, not be treated as "the cache says
+    /// this is handled" and skipped.
+    #[tokio::test]
+    async fn path_hashed_cache_hit_that_is_already_present_still_gets_added_to_album() {
+        let path = "/library/photo.jpg";
+        let contents = b"learned by a different job against the same export instance";
+        let fx = path_hashed_fixture(1, "photo.jpg", path, contents);
+        let (export_base, downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+
+        let existing_id = Uuid::from_u128(0xF000_0000_0000_0000_0000_0000_0000_0001);
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .by_checksum
+                .insert(content_checksum(contents), existing_id);
+        }
+
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        cache.insert(
+            TEST_EXPORT_INSTANCE,
+            fx.checksum.clone(),
+            default_modified(),
+            content_checksum(contents),
+        );
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.cache_hits, 1, "must be served from the warm cache");
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(
+            summary.added_to_album, 1,
+            "a cache hit that turns out to be a duplicate must still reach step 4"
+        );
+        assert_eq!(summary.failed, 0);
+        assert_eq!(
+            downloads.load(Ordering::Relaxed),
+            0,
+            "a cache hit must never download"
+        );
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .album_members
+                .get(&ALBUM_ID)
+                .is_some_and(|members| members.contains(&existing_id)),
+            "the existing import-side asset must be added to the album, not silently dropped"
+        );
     }
 }
