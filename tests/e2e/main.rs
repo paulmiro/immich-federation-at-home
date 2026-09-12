@@ -484,7 +484,7 @@ async fn mirrors_an_album_end_to_end() {
         cache,
         transfers,
         settings.globals.transfer_concurrency,
-        settings.globals.cache_dir.as_deref(),
+        settings.globals.tmp_dir.clone(),
     )
     .await
     .expect("run_startup should succeed against two freshly-provisioned real instances");

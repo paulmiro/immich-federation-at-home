@@ -280,6 +280,7 @@ impl MockServer {
             RetryPolicy::zero_delay(),
             Arc::new(ContentHashCache::disabled()),
             Arc::new(Semaphore::new(4)),
+            None,
         )
     }
 }
@@ -835,7 +836,7 @@ async fn run_startup_builds_a_working_sync_context() {
         Arc::new(ContentHashCache::disabled()),
         Arc::new(Semaphore::new(4)),
         settings.globals.transfer_concurrency,
-        settings.globals.cache_dir.as_deref(),
+        settings.globals.tmp_dir.clone(),
     )
     .await
     .expect("startup should succeed against the mock");

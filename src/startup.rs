@@ -1,16 +1,25 @@
-//! The ten-step startup sequence (`PLAN.md` §5): version-gate both servers, validate the
-//! shared link's own settings, check the import API key's permissions, resolve the target
-//! album, and log a summary — everything `main.rs` needs before it can build a
-//! [`crate::sync::SyncContext`] and start the scheduler.
+//! The per-job remote-checks sequence (`PLAN.md` §5 steps 3-10, `scratch/JOBS-DESIGN.md`'s
+//! "Startup moves into the job loop"): version-gate both servers, validate the shared
+//! link's own settings, check the import API key's permissions, resolve the target album,
+//! and log a summary — everything one job needs before it can build a
+//! [`crate::sync::SyncContext`] and start running.
 //!
-//! Steps 1 ("parse config; validate") and 2 ("set the log level") are deliberately *not*
-//! here: they're one-shot, process-global side effects (`clap::Parser::parse` reads real
-//! argv/env, and the log threshold is process-wide) that can't be meaningfully unit tested,
-//! so `main.rs` does them directly. Everything from step
-//! 3 onward — parsing `EXPORT_ALBUM_URL`, both version gates, the shared-link assertions,
-//! the permission check, and album resolution — is pure enough or HTTP-driven-but-testable
-//! enough to live here, per this task's brief. [`run_startup`] is the orchestrating async
-//! function `main.rs` actually calls; everything else in this module is a smaller piece it
+//! This is **not** a once-per-process step. [`run_startup`] is called from
+//! `job::JobRunner::tick`, lazily, once per job — on that job's first tick, and again on any
+//! later tick after a previous attempt failed — never on a tick that already has a working
+//! [`crate::sync::SyncContext`]. A failure here is an ordinary `Err`, not a process exit: one
+//! friend's expired share link must not touch any other job, so it's the caller (`job.rs`,
+//! then `scheduler::run`) that decides to log it and retry on the job's next tick, not this
+//! module or `main.rs`.
+//!
+//! Steps 1 ("parse config; validate") and 2 ("set the log level") are still deliberately
+//! *not* here: they're one-shot, process-global side effects (`clap::Parser::parse` reads
+//! real argv/env, and the log threshold is process-wide) that can't be meaningfully unit
+//! tested, so `main.rs` does them directly, once, before any job starts. Everything from
+//! step 3 onward — parsing `export_album_url`, both version gates, the shared-link
+//! assertions, the permission check, and album resolution — runs again for every job, and
+//! again on every retried attempt. [`run_startup`] is the orchestrating async function
+//! `job::JobRunner::tick` calls; everything else in this module is a smaller piece it
 //! composes, each independently unit tested below.
 
 use std::sync::Arc;
@@ -191,9 +200,13 @@ pub fn check_api_key_permissions(key: &dto::ApiKeyResponseDto) -> anyhow::Result
 // Startup summary (§5 step 10)
 // ---------------------------------------------------------------------------------------
 
-/// Everything `PLAN.md` §5 step 10 wants logged once startup succeeds. Returned (not just
-/// logged) so `main.rs` and this module's own integration test can inspect it directly
+/// Everything `PLAN.md` §5 step 10 wants logged once a job's checks succeed. Returned (not
+/// just logged) so `job.rs` and this module's own integration test can inspect it directly
 /// rather than scraping log output.
+///
+/// No cache field here: the content-hash cache is one process-wide resource, not a per-job
+/// one (`scratch/JOBS-DESIGN.md`), so its status is logged once from `main.rs` via
+/// [`cache_summary`] instead of being repeated in every job's summary.
 #[derive(Debug, Clone)]
 pub struct StartupSummary {
     pub export_version: Version,
@@ -207,16 +220,12 @@ pub struct StartupSummary {
     pub target_album_id: Uuid,
     pub interval: std::time::Duration,
     pub concurrency: u32,
-    /// The cache line for the startup summary: `cache=disabled` when `CACHE_DIR` is unset, or
-    /// `cache=<dir> entries=<n>` when it's open and loaded. Rendered once here (rather than
-    /// carrying `dir`/`entry_count` separately into [`StartupSummary`]) so
-    /// [`ContentHashCache`] stays the single source of truth for its own state.
-    pub cache_summary: String,
 }
 
-/// Renders the `cache=…` field [`StartupSummary::log`] appends — its own function since
-/// [`run_startup`] needs the exact same text to build [`StartupSummary`].
-fn cache_summary(cache: &ContentHashCache, dir: Option<&std::path::Path>) -> String {
+/// Renders the process-wide `cache=…` startup line: `cache=disabled` when `CACHE_DIR` is
+/// unset, or `cache=<dir> entries=<n>` when it's open and loaded. `main.rs` logs this once,
+/// itself, rather than each job repeating it — see [`StartupSummary`]'s doc comment.
+pub fn cache_summary(cache: &ContentHashCache, dir: Option<&std::path::Path>) -> String {
     match dir {
         Some(dir) => format!("cache={} entries={}", dir.display(), cache.entry_count()),
         None => "cache=disabled".to_owned(),
@@ -225,6 +234,8 @@ fn cache_summary(cache: &ContentHashCache, dir: Option<&std::path::Path>) -> Str
 
 impl StartupSummary {
     /// Emits the single `info`-level "startup complete" line `PLAN.md` §5 step 10 asks for.
+    /// Logged from inside a `log::with_job` scope (`job.rs`), so it carries `job=<name>`
+    /// like every other line that job produces.
     pub fn log(&self) {
         let expires_at = self
             .share_link_expires_at
@@ -237,7 +248,7 @@ impl StartupSummary {
             "startup complete export_version={} import_version={} share_link_id={} \
              share_link_type={} share_link_expires_at={expires_at} export_album={:?} \
              export_asset_count={} import_album={:?} import_album_id={} interval={} \
-             concurrency={} {}",
+             concurrency={}",
             self.export_version,
             self.import_version,
             self.share_link_id,
@@ -247,8 +258,7 @@ impl StartupSummary {
             self.target_album_name,
             self.target_album_id,
             humantime::format_duration(self.interval),
-            self.concurrency,
-            self.cache_summary
+            self.concurrency
         );
     }
 }
@@ -269,22 +279,23 @@ pub struct StartupOutcome {
 /// Runs `PLAN.md` §5 steps 3 through 10 in order, each with its own actionable failure
 /// message (naming the env var or the remote-side setting to change, never a bare
 /// propagated HTTP error) — see the individual step functions above for the exact wording.
-/// `Err` here is always fatal: `main.rs` logs it and exits non-zero, per §5's "the process
-/// exits non-zero on any failure".
+/// `Err` here is **not** process-fatal: it is called from `job::JobRunner::tick`, which
+/// leaves its `SyncContext` unset on failure so the next tick retries it — see this module's
+/// top-level doc comment. Only `main.rs` failing to build the process-wide cache or
+/// semaphore before any job starts is still fatal to the whole process.
 ///
-/// `cache`, `transfers`, `transfer_concurrency`, and `cache_dir` are all process-level
+/// `cache`, `transfers`, `transfer_concurrency`, and `tmp_dir` are all process-level
 /// resources/settings (`scratch/JOBS-DESIGN.md`'s `Settings::globals`), not `Job` fields —
-/// `main.rs` builds/reads them once and passes the same values into every job's
-/// `run_startup` call, rather than this function building its own or reaching into a
-/// config type that doesn't exist per job. Only `interval` and the two timeouts come from
-/// `job` itself. `cache_dir` is only used for the summary's `cache=…` line (the cache
-/// itself doesn't expose which directory it was opened with).
+/// `main.rs` builds/reads them once and `job::JobRunner` passes the same values into every
+/// `run_startup` call for its job, rather than this function building its own or reaching
+/// into a config type that doesn't exist per job. Only `interval` and the two timeouts come
+/// from `job` itself.
 pub async fn run_startup(
     job: &Job,
     cache: Arc<ContentHashCache>,
     transfers: Arc<Semaphore>,
     transfer_concurrency: u32,
-    cache_dir: Option<&std::path::Path>,
+    tmp_dir: Option<std::path::PathBuf>,
 ) -> anyhow::Result<StartupOutcome> {
     // Step 3 — parse export_album_url.
     let (export_api_base, share_ref) = crate::share_url::parse_share_url(&job.export_album_url)
@@ -379,7 +390,6 @@ pub async fn run_startup(
         target_album_id: target_album.id,
         interval: job.interval,
         concurrency: transfer_concurrency,
-        cache_summary: cache_summary(&cache, cache_dir),
     };
     summary.log();
 
@@ -394,6 +404,7 @@ pub async fn run_startup(
         retry_policy,
         cache,
         transfers,
+        tmp_dir,
     );
 
     Ok(StartupOutcome { sync, summary })

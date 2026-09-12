@@ -1,8 +1,9 @@
 //! The per-run sync algorithm (`PLAN.md` §6): list the export album, ask the import
 //! instance which of those assets it already has, transfer whatever's missing, and make
 //! sure every import-side asset (freshly uploaded or already present) ends up in the
-//! target album. One [`SyncContext`] is built once at startup (`main.rs`, a later step)
-//! and [`SyncContext::run_once`] is called on every tick.
+//! target album. One [`SyncContext`] is built once per job, by that job's own remote-checks
+//! pass (`startup::run_startup`, called lazily from `job::JobRunner::tick` — see those
+//! modules' doc comments), and [`SyncContext::run_once`] is called on every tick after that.
 //!
 //! Properties this preserves, straight from `PLAN.md` §6:
 //! * **Idempotent** — a second run right after the first transfers nothing and re-adds
@@ -16,6 +17,7 @@
 //!   `Err` from [`SyncContext::run_once`]) but not the process — the next tick retries.
 
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -111,10 +113,17 @@ pub struct SyncContext {
     /// thing that actually bounds how many assets are staged in `TMPDIR` at once, which is
     /// what the README's tmpfs sizing advice is written against.
     transfers: Arc<Semaphore>,
+    /// `Globals::tmp_dir` (`scratch/JOBS-DESIGN.md`'s Keys table) — where to stage each
+    /// asset's bytes while it's in flight. `None` means "let `tempfile` pick the platform
+    /// default", exactly as before this field existed. A plain `Option<PathBuf>`, not an
+    /// `Arc`: it's one small, cheaply-cloned value read in exactly one place
+    /// ([`Self::transfer_one_inner`]), with nothing to share across jobs the way `cache` and
+    /// `transfers` above are shared.
+    tmp_dir: Option<PathBuf>,
 }
 
 impl SyncContext {
-    /// 10 constructor arguments rather than a builder or params struct: every field is a
+    /// 11 constructor arguments rather than a builder or params struct: every field is a
     /// distinct, already-well-named piece of startup state (see each field's own doc comment
     /// above) built exactly once per job (`startup.rs::run_startup`) and once more in this
     /// module's own tests — there is no repeated or optional-subset call site that a builder
@@ -131,6 +140,7 @@ impl SyncContext {
         download_retry_policy: RetryPolicy,
         cache: Arc<ContentHashCache>,
         transfers: Arc<Semaphore>,
+        tmp_dir: Option<PathBuf>,
     ) -> Self {
         Self {
             export,
@@ -143,6 +153,7 @@ impl SyncContext {
             download_retry_policy,
             cache,
             transfers,
+            tmp_dir,
         }
     }
 
@@ -531,11 +542,15 @@ impl SyncContext {
         // thread. Only the *path* is kept afterwards (`into_temp_path`); all actual
         // reading/writing goes through `tokio::fs` over that path, which dispatches its
         // own I/O to the blocking pool per call already.
-        let temp_path = match spawn_blocking(|| {
-            TempFileBuilder::new()
-                .prefix("immich-federation-")
-                .tempfile()
-                .map(NamedTempFile::into_temp_path)
+        let tmp_dir = self.tmp_dir.clone();
+        let temp_path = match spawn_blocking(move || {
+            let mut builder = TempFileBuilder::new();
+            builder.prefix("immich-federation-");
+            match &tmp_dir {
+                Some(dir) => builder.tempfile_in(dir),
+                None => builder.tempfile(),
+            }
+            .map(NamedTempFile::into_temp_path)
         })
         .await
         {
@@ -1208,6 +1223,7 @@ mod tests {
             RetryPolicy::zero_delay(),
             Arc::new(cache),
             Arc::new(Semaphore::new(4)),
+            None,
         )
     }
 

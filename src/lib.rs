@@ -9,12 +9,14 @@
 //!
 //! Modules land here incrementally as `PLAN.md` §12's task list works through them; so far
 //! that's configuration parsing, logging, share-link parsing, the shared Immich HTTP
-//! plumbing + DTOs, the retry helper, the per-run sync algorithm, the startup sequence, and
-//! the scheduler.
+//! plumbing + DTOs, the retry helper, the per-run sync algorithm, the startup sequence, the
+//! scheduler, and (`scratch/JOBS-DESIGN.md`) the per-job runtime state that ties the last
+//! two together across n concurrently running jobs.
 
 pub mod cache;
 pub mod config;
 pub mod immich;
+pub mod job;
 pub mod log;
 pub mod retry;
 pub mod scheduler;

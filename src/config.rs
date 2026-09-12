@@ -153,11 +153,10 @@ impl Job {
 pub struct Globals {
     pub log_level: Level,
     pub cache_dir: Option<PathBuf>,
-    /// Resolved but not yet wired up: nothing in this crate reads it yet.
-    /// `sync.rs`'s temp-file creation (via `tempfile`) still uses the system default, and
-    /// switching that over belongs to the runtime agent (`std::env::set_var("TMPDIR", …)`
-    /// isn't an option here — it's `unsafe` under edition 2024 and this crate `forbid`s
-    /// `unsafe_code`, so the temp-file builder will need to be told the directory directly).
+    /// Where each in-flight asset is staged, handed to `SyncContext` and used by its
+    /// temp-file builder directly rather than by exporting `TMPDIR` to the process
+    /// (`std::env::set_var` is `unsafe` under edition 2024 and this crate `forbid`s
+    /// `unsafe_code`). Unset means the platform's default temp directory.
     pub tmp_dir: Option<PathBuf>,
     pub transfer_concurrency: u32,
 }
