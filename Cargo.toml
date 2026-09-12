@@ -39,6 +39,7 @@ sha1 = "0.11.0"
 tempfile = "3.27.0"
 thiserror = "2.0.20"
 tokio = { version = "1.53.1", features = ["rt-multi-thread", "macros", "signal", "fs", "time", "io-util", "sync"] }
+toml = { version = "0.9", default-features = false, features = ["parse", "serde"] }
 tokio-util = { version = "0.7.19", features = ["io"] }
 url = "2.5.8"
 uuid = { version = "1.24.0", features = ["serde"] }

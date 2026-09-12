@@ -12,30 +12,74 @@
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use clap::Parser;
+use clap::CommandFactory;
 use tokio::signal::unix::{SignalKind, signal};
 use tokio::sync::Semaphore;
 
+use anyhow::Context;
 use immich_federation_at_home::cache::ContentHashCache;
-use immich_federation_at_home::config::Config;
+use immich_federation_at_home::config::{self, Cli, ConfigSource, ConfigText, Settings};
 use immich_federation_at_home::scheduler::{self, ShutdownSignal};
 use immich_federation_at_home::{error, format_error_chain, info, log, startup, warn};
 
+/// The real `std::env::var`, wrapped to fit [`config::load`]'s injected-lookup signature —
+/// every test instead supplies a closure over a plain `HashMap`, since mutating the real
+/// environment is unsound to do from a test (`std::env::set_var` is `unsafe` under edition
+/// 2024, and this crate `forbid`s `unsafe_code` outright regardless).
+fn real_env(key: &str) -> Option<String> {
+    std::env::var(key).ok()
+}
+
+/// `--config`/`CONFIG_FILE`/`CONFIG`: resolved without touching the filesystem, then (for a
+/// path) read here — `config::load` itself never does disk I/O for the main config source,
+/// only for `_file` secrets, so every other rule it applies is unit-testable against literal
+/// TOML strings (see `config.rs`'s own tests). Pulled out of `main` just to keep that
+/// function's line count down; the error-reporting shape (`Result` in, `eprintln!` +
+/// `ExitCode::FAILURE` out) is identical to every other startup failure in `main`.
+fn resolve_settings(matches: &clap::ArgMatches) -> anyhow::Result<Settings> {
+    let env: &dyn Fn(&str) -> Option<String> = &real_env;
+    let source = config::resolve_config_source(matches, env)?;
+    let config_text = match &source {
+        None => None,
+        Some(ConfigSource::Inline(text)) => Some(text.clone()),
+        Some(ConfigSource::Path(path)) => Some(
+            std::fs::read_to_string(path)
+                .with_context(|| format!("could not read config file {}", path.display()))?,
+        ),
+    };
+    let config = config_text.as_deref().map(|toml| ConfigText {
+        toml,
+        path: match &source {
+            Some(ConfigSource::Path(path)) => Some(path.as_path()),
+            _ => None,
+        },
+    });
+    config::load(matches, env, config)
+}
+
 #[tokio::main]
 async fn main() -> ExitCode {
-    // PLAN.md §5 step 1: parse config, then its semantic validation (clap's derive already
-    // enforces types; `Config::validate` covers the rest — a non-empty API key, non-zero
-    // interval/timeouts/concurrency). The configured log level isn't in effect yet at this
-    // point, so a failure here is reported the same way clap's own parse errors already are:
-    // straight to stderr, no log formatting.
-    let config = Config::parse();
-    if let Err(err) = config.validate() {
-        eprintln!("Error: {err}");
-        return ExitCode::FAILURE;
-    }
+    // Bad argv still gets clap's own formatted error and exit code, exactly as
+    // `Cli::parse()` would have given — `try_get_matches_from` + `.exit()` is what lets us
+    // keep the raw `ArgMatches` below (needed for `value_source`, see `config::load`)
+    // instead of just a parsed `Cli`.
+    let matches = match Cli::command().try_get_matches_from(std::env::args_os()) {
+        Ok(matches) => matches,
+        Err(err) => err.exit(),
+    };
 
-    // PLAN.md §5 step 2.
-    log::set_level(config.log_level);
+    // Config parsing, precedence, inheritance, secrets, and validation all happen inside
+    // `load` — see `config.rs`. The configured log level isn't in effect yet at this point,
+    // so a failure here is reported the same way clap's own parse errors already are:
+    // straight to stderr, no log formatting.
+    let settings = match resolve_settings(&matches) {
+        Ok(settings) => settings,
+        Err(err) => {
+            eprintln!("Error: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
+    log::set_level(settings.globals.log_level);
 
     // The content-hash cache (`scratch/CACHE-DESIGN.md`) and the process-wide transfer
     // semaphore (`scratch/JOBS-DESIGN.md`'s "Global transfer cap") are both process-level
@@ -45,7 +89,7 @@ async fn main() -> ExitCode {
     // loud, immediate startup failure rather than a warning discovered only once the first
     // run tries to save the cache: this is always user error (typically a root-owned bind
     // mount) and must be caught here.
-    let cache = match &config.cache_dir {
+    let cache = match &settings.globals.cache_dir {
         Some(dir) => match ContentHashCache::open(dir) {
             Ok(cache) => cache,
             Err(err) => {
@@ -64,18 +108,42 @@ async fn main() -> ExitCode {
         None => ContentHashCache::disabled(),
     };
     let cache = Arc::new(cache);
-    // `Config::validate` (above) already rejects 0; `.max(1)` is cheap insurance against a
-    // `Semaphore::new(0)` that would never let any transfer through.
+    // `Globals::validate` (inside `load`, above) already rejects 0; `.max(1)` is cheap
+    // insurance against a `Semaphore::new(0)` that would never let any transfer through.
     let transfers = Arc::new(Semaphore::new(
-        usize::try_from(config.import_concurrency)
+        usize::try_from(settings.globals.transfer_concurrency)
             .unwrap_or(usize::MAX)
             .max(1),
     ));
 
+    // TODO(runtime-agent): this whole single-job branch is a deliberate, temporary bridge —
+    // `scratch/JOBS-DESIGN.md`'s "one task per job" scheduling isn't wired up yet, so more
+    // than one configured job can't run at all yet. Delete this check once `main.rs` spawns
+    // one task per job into a `JoinSet` instead.
+    let job = match settings.jobs.as_slice() {
+        [job] => job,
+        jobs => {
+            error!(
+                "{} jobs are configured, but this build only runs a single job; per-job \
+                 scheduling is not wired up yet",
+                jobs.len()
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+
     // PLAN.md §5 steps 3-10. Sample output (both success and failure) is in this task's
     // report; every failure here is actionable prose naming the env var or the remote-side
     // setting to fix, never a bare propagated HTTP error — see `startup.rs`.
-    let outcome = match startup::run_startup(&config, cache, transfers).await {
+    let outcome = match startup::run_startup(
+        job,
+        cache,
+        transfers,
+        settings.globals.transfer_concurrency,
+        settings.globals.cache_dir.as_deref(),
+    )
+    .await
+    {
         Ok(outcome) => outcome,
         Err(err) => {
             error!("{}", format_error_chain(&err));
@@ -93,8 +161,8 @@ async fn main() -> ExitCode {
     let perform_run = || async { sync.run_once().await.map(|_summary| ()) };
 
     match scheduler::run(
-        config.import_interval,
-        config.run_once,
+        job.interval,
+        settings.run_once,
         shutdown.as_ref(),
         perform_run,
     )
@@ -109,8 +177,8 @@ async fn main() -> ExitCode {
 /// [`ShutdownSignal::trigger`] — see `scheduler.rs`'s own top-level doc comment for exactly
 /// what "graceful" means in this codebase: the current sync run (if any) is always allowed
 /// to finish — never interrupted mid-asset — but no new run starts afterward, and a pending
-/// sleep between runs is cut short immediately rather than waiting out the rest of
-/// `IMPORT_INTERVAL`.
+/// sleep between runs is cut short immediately rather than waiting out the rest of the job's
+/// own `interval`.
 ///
 /// A **second** signal is deliberately *not* routed through that graceful path at all: it
 /// calls [`std::process::exit`] directly, immediately, from wherever this task happens to be

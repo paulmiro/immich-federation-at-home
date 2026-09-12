@@ -27,7 +27,7 @@ use axum::routing::{get, post, put};
 use axum::{Json, Router};
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use clap::Parser;
+use clap::CommandFactory;
 use serde_json::json;
 use sha1::{Digest, Sha1};
 use tokio::sync::Semaphore;
@@ -36,7 +36,7 @@ use url::Url;
 use uuid::Uuid;
 
 use immich_federation_at_home::cache::ContentHashCache;
-use immich_federation_at_home::config::{Config, Secret};
+use immich_federation_at_home::config::{self, Cli, Secret};
 use immich_federation_at_home::immich::dto;
 use immich_federation_at_home::immich::export::{ExportClient, ExportError};
 use immich_federation_at_home::immich::import::ImportClient;
@@ -811,26 +811,31 @@ async fn paginated_album_follows_all_three_pages() {
 async fn run_startup_builds_a_working_sync_context() {
     let server = MockServer::spawn(vec![fixture(1, "a.jpg", b"asset one bytes")]).await;
 
-    let config = Config::try_parse_from([
-        "immich-federation-at-home",
-        "--export-album-url",
-        &format!(
-            "{}share/test-key",
-            server.export_base.as_str().trim_end_matches("api")
-        ),
-        "--import-server-url",
-        server.import_base.as_str().trim_end_matches("/api"),
-        "--import-api-key",
-        "test-api-key",
-        "--import-album",
-        &IMPORT_ALBUM_ID.to_string(),
-    ])
-    .unwrap();
+    let matches = Cli::command()
+        .try_get_matches_from([
+            "immich-federation-at-home",
+            "--export-album-url",
+            &format!(
+                "{}share/test-key",
+                server.export_base.as_str().trim_end_matches("api")
+            ),
+            "--import-server-url",
+            server.import_base.as_str().trim_end_matches("/api"),
+            "--import-api-key",
+            "test-api-key",
+            "--import-album",
+            &IMPORT_ALBUM_ID.to_string(),
+        ])
+        .unwrap();
+    let settings = config::load(&matches, &|_: &str| None, None).unwrap();
+    let job = &settings.jobs[0];
 
     let outcome = run_startup(
-        &config,
+        job,
         Arc::new(ContentHashCache::disabled()),
         Arc::new(Semaphore::new(4)),
+        settings.globals.transfer_concurrency,
+        settings.globals.cache_dir.as_deref(),
     )
     .await
     .expect("startup should succeed against the mock");

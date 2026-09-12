@@ -21,7 +21,7 @@ use tokio::sync::Semaphore;
 use uuid::Uuid;
 
 use crate::cache::ContentHashCache;
-use crate::config::Config;
+use crate::config::Job;
 use crate::immich::export::{ExportClient, ExportError, LoginOutcome};
 use crate::immich::import::ImportClient;
 use crate::immich::{Version, dto};
@@ -272,18 +272,23 @@ pub struct StartupOutcome {
 /// `Err` here is always fatal: `main.rs` logs it and exits non-zero, per §5's "the process
 /// exits non-zero on any failure".
 ///
-/// `cache` and `transfers` are process-level resources (`scratch/JOBS-DESIGN.md`): the cache
-/// is opened once and shared by every job, and the transfer semaphore caps assets in flight
-/// across every job, so `main.rs` builds both before calling this rather than this function
-/// building its own.
+/// `cache`, `transfers`, `transfer_concurrency`, and `cache_dir` are all process-level
+/// resources/settings (`scratch/JOBS-DESIGN.md`'s `Settings::globals`), not `Job` fields —
+/// `main.rs` builds/reads them once and passes the same values into every job's
+/// `run_startup` call, rather than this function building its own or reaching into a
+/// config type that doesn't exist per job. Only `interval` and the two timeouts come from
+/// `job` itself. `cache_dir` is only used for the summary's `cache=…` line (the cache
+/// itself doesn't expose which directory it was opened with).
 pub async fn run_startup(
-    config: &Config,
+    job: &Job,
     cache: Arc<ContentHashCache>,
     transfers: Arc<Semaphore>,
+    transfer_concurrency: u32,
+    cache_dir: Option<&std::path::Path>,
 ) -> anyhow::Result<StartupOutcome> {
-    // Step 3 — parse EXPORT_ALBUM_URL.
-    let (export_api_base, share_ref) = crate::share_url::parse_share_url(&config.export_album_url)
-        .context("failed to parse EXPORT_ALBUM_URL")?;
+    // Step 3 — parse export_album_url.
+    let (export_api_base, share_ref) = crate::share_url::parse_share_url(&job.export_album_url)
+        .context("failed to parse export_album_url")?;
     // Captured now, before `export_api_base` moves into `ExportClient::new` below: this is
     // the cache namespace key `scratch/JOBS-DESIGN.md` specifies (the normalized export API
     // base URL, as an opaque string).
@@ -293,8 +298,8 @@ pub async fn run_startup(
     let export = ExportClient::new(
         export_api_base,
         share_ref,
-        config.request_timeout,
-        config.transfer_timeout,
+        job.request_timeout,
+        job.transfer_timeout,
         retry_policy.clone(),
     )
     .context("failed to build the export-side HTTP client")?;
@@ -308,15 +313,15 @@ pub async fn run_startup(
     check_export_version(export_version)?;
 
     // Step 5 — E2: shared-link password login, only if one is configured.
-    if let Some(password) = &config.export_album_password {
+    if let Some(password) = &job.export_album_password {
         match export.login(password).await {
             Ok(LoginOutcome::LoggedIn) => info!("logged in to the export shared link"),
             // `NotPasswordProtected` already warns inside `ExportClient::login` itself.
             Ok(LoginOutcome::NotPasswordProtected) => {}
             Err(ExportError::WrongPassword) => {
                 anyhow::bail!(
-                    "the export instance rejected EXPORT_ALBUM_PASSWORD with 401 Unauthorized: \
-                     either the password is wrong, or EXPORT_ALBUM_URL's key/slug itself is \
+                    "the export instance rejected export_album_password with 401 Unauthorized: \
+                     either the password is wrong, or export_album_url's key/slug itself is \
                      invalid. Double check both."
                 );
             }
@@ -333,10 +338,10 @@ pub async fn run_startup(
 
     // Import client, built now so steps 7-9 can use it.
     let import = ImportClient::new(
-        config.import_api_base()?,
-        &config.import_api_key,
-        config.request_timeout,
-        config.transfer_timeout,
+        job.import_api_base()?,
+        &job.import_api_key,
+        job.request_timeout,
+        job.transfer_timeout,
         retry_policy.clone(),
     )
     .context("failed to build the import-side HTTP client")?;
@@ -356,10 +361,10 @@ pub async fn run_startup(
         .context("failed to fetch the import API key's own permissions (GET /api-keys/me)")?;
     check_api_key_permissions(&api_key)?;
 
-    // Step 9 — I3: resolve IMPORT_ALBUM. `ImportError`'s own messages (album-not-found by
+    // Step 9 — I3: resolve import_album. `ImportError`'s own messages (album-not-found by
     // id, by name with the available albums listed, or ambiguous-name with the matching
     // ids) are already exactly the actionable text §5 step 9 asks for — nothing to add.
-    let target_album = import.resolve_album(&config.import_album_ref()).await?;
+    let target_album = import.resolve_album(&job.import_album_ref()).await?;
 
     // Step 10 — summary.
     let summary = StartupSummary {
@@ -372,9 +377,9 @@ pub async fn run_startup(
         source_asset_count: album_info.asset_count,
         target_album_name: target_album.album_name,
         target_album_id: target_album.id,
-        interval: config.import_interval,
-        concurrency: config.import_concurrency,
-        cache_summary: cache_summary(&cache, config.cache_dir.as_deref()),
+        interval: job.interval,
+        concurrency: transfer_concurrency,
+        cache_summary: cache_summary(&cache, cache_dir),
     };
     summary.log();
 
@@ -384,8 +389,8 @@ pub async fn run_startup(
         album_info.album_id,
         target_album.id,
         export_instance,
-        config.import_concurrency,
-        config.transfer_timeout,
+        transfer_concurrency,
+        job.transfer_timeout,
         retry_policy,
         cache,
         transfers,
@@ -397,7 +402,25 @@ pub async fn run_startup(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use clap::Parser;
+    use std::str::FromStr;
+
+    use crate::config::Secret;
+
+    /// A minimal, valid `Job` for `run_startup` tests below — every field required fields
+    /// filled with a placeholder, callers override what they care about.
+    fn test_job(export_album_url: &str, import_server_url: &str, import_album: &str) -> Job {
+        Job {
+            name: "default".to_owned(),
+            export_album_url: export_album_url.to_owned(),
+            export_album_password: None,
+            import_server_url: import_server_url.to_owned(),
+            import_api_key: Secret::from_str("test-api-key").unwrap(),
+            import_album: import_album.to_owned(),
+            interval: std::time::Duration::from_secs(3600),
+            request_timeout: std::time::Duration::from_secs(30),
+            transfer_timeout: std::time::Duration::from_secs(30 * 60),
+        }
+    }
 
     // ---- version gates -------------------------------------------------------------------
 
@@ -637,23 +660,18 @@ mod tests {
             spawn_test_server(Router::new().nest("/api", import_app())).await;
 
         let target_album_id = "8a5e1e2b-2222-4444-8888-aaaaaaaaaaaa";
-        let config = Config::try_parse_from([
-            "immich-federation-at-home",
-            "--export-album-url",
+        let job = test_job(
             &format!("{export_base}share/testkey"),
-            "--import-server-url",
             import_base.as_str(),
-            "--import-api-key",
-            "test-api-key",
-            "--import-album",
             target_album_id,
-        ])
-        .unwrap();
+        );
 
         let outcome = run_startup(
-            &config,
+            &job,
             Arc::new(ContentHashCache::disabled()),
             Arc::new(Semaphore::new(4)),
+            4,
+            None,
         )
         .await
         .expect("startup should succeed");
@@ -692,24 +710,19 @@ mod tests {
         let (import_base, _import_server) =
             spawn_test_server(Router::new().nest("/api", restricted_import_app)).await;
 
-        let config = Config::try_parse_from([
-            "immich-federation-at-home",
-            "--export-album-url",
+        let job = test_job(
             &format!("{export_base}share/testkey"),
-            "--import-server-url",
             import_base.as_str(),
-            "--import-api-key",
-            "test-api-key",
-            "--import-album",
             "8a5e1e2b-2222-4444-8888-aaaaaaaaaaaa",
-        ])
-        .unwrap();
+        );
 
         assert!(
             run_startup(
-                &config,
+                &job,
                 Arc::new(ContentHashCache::disabled()),
-                Arc::new(Semaphore::new(4))
+                Arc::new(Semaphore::new(4)),
+                4,
+                None,
             )
             .await
             .is_err(),

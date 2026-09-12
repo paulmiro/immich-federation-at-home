@@ -47,7 +47,7 @@ use std::time::Duration;
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
-use clap::Parser;
+use clap::CommandFactory;
 use reqwest::multipart;
 use serde_json::{Value, json};
 use sha1::{Digest, Sha1};
@@ -56,7 +56,7 @@ use url::Url;
 use uuid::Uuid;
 
 use immich_federation_at_home::cache::ContentHashCache;
-use immich_federation_at_home::config::Config;
+use immich_federation_at_home::config::{self, Cli};
 use immich_federation_at_home::startup::run_startup;
 
 /// Host port the export stack's `immich-server` publishes (`tests/e2e/compose.yaml`).
@@ -403,6 +403,10 @@ fn fixture_paths() -> Vec<PathBuf> {
 /// re-run against stacks that were not torn down with `down -v` will fail there.
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "requires `docker compose -f tests/e2e/compose.yaml up -d --wait`"]
+// One long, linear, step-numbered scenario is more readable here than splitting it up would
+// be — see this test's own doc comment. It crept a few lines past clippy's default
+// threshold when the `Settings`-resolution step grew from one flag-parsing call into two.
+#[allow(clippy::too_many_lines)]
 async fn mirrors_an_album_end_to_end() {
     let fixtures = fixture_paths();
 
@@ -447,35 +451,43 @@ async fn mirrors_an_album_end_to_end() {
     let import_api_key = import.create_scoped_api_key("e2e sync key").await;
     let import_album_id = import.create_album("e2e target album").await;
 
-    // Step 6 — run the sync through the library, exactly as `main.rs` does: parse a `Config`,
-    // run the full startup sequence (§5), then call `SyncContext::run_once` directly rather
-    // than looping the scheduler — the scheduler's `RUN_ONCE` mode (`scheduler::run` with
+    // Step 6 — run the sync through the library, exactly as `main.rs` does: resolve
+    // `Settings` (no config file, so this forms the implicit single `default` job), run the
+    // full startup sequence (§5), then call `SyncContext::run_once` directly rather than
+    // looping the scheduler — the scheduler's `RUN_ONCE` mode (`scheduler::run` with
     // `run_once: true`) does exactly one call to the same function, so calling it directly
     // here is equivalent and lets the test assert on each run's `RunSummary`.
-    let config = Config::try_parse_from([
-        "immich-federation-at-home",
-        "--export-album-url",
-        &format!("http://127.0.0.1:{EXPORT_PORT}/share/{share_key}"),
-        "--export-album-password",
-        SHARE_PASSWORD,
-        "--import-server-url",
-        &format!("http://127.0.0.1:{IMPORT_PORT}"),
-        "--import-api-key",
-        &import_api_key,
-        "--import-album",
-        &import_album_id.to_string(),
-        "--once",
-    ])
-    .expect("Config should parse from well-formed CLI args");
-    config
-        .validate()
-        .expect("Config should pass semantic validation");
+    let matches = Cli::command()
+        .try_get_matches_from([
+            "immich-federation-at-home",
+            "--export-album-url",
+            &format!("http://127.0.0.1:{EXPORT_PORT}/share/{share_key}"),
+            "--export-album-password",
+            SHARE_PASSWORD,
+            "--import-server-url",
+            &format!("http://127.0.0.1:{IMPORT_PORT}"),
+            "--import-api-key",
+            &import_api_key,
+            "--import-album",
+            &import_album_id.to_string(),
+            "--once",
+        ])
+        .expect("argv should parse");
+    let settings = config::load(&matches, &|_: &str| None, None)
+        .expect("Settings should resolve from well-formed CLI args");
+    let job = &settings.jobs[0];
 
     let cache = Arc::new(ContentHashCache::disabled());
     let transfers = Arc::new(Semaphore::new(4));
-    let outcome = run_startup(&config, cache, transfers)
-        .await
-        .expect("run_startup should succeed against two freshly-provisioned real instances");
+    let outcome = run_startup(
+        job,
+        cache,
+        transfers,
+        settings.globals.transfer_concurrency,
+        settings.globals.cache_dir.as_deref(),
+    )
+    .await
+    .expect("run_startup should succeed against two freshly-provisioned real instances");
     assert_eq!(outcome.summary.source_asset_count, fixtures.len() as u64);
     assert_eq!(outcome.summary.target_album_id, import_album_id);
 

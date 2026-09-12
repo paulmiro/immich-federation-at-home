@@ -37,7 +37,13 @@ use clap::ValueEnum;
 
 /// Log verbosity, ordered least to most verbose. The derived [`Ord`] is what
 /// [`enabled`] filters on: an event is emitted when its level is `<=` the threshold.
-#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+///
+/// `serde::Deserialize` (lowercase, matching `LOG_LEVEL`'s accepted spellings and this
+/// type's own `Display`) is here rather than derived ad hoc in `config.rs` because a type's
+/// `Deserialize` impl belongs next to the type — `config.rs` just needs `log_level = "info"`
+/// in a TOML file to work, which this one derive plus `rename_all` gives it for free.
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum Level {
     Error,
     Warn,
