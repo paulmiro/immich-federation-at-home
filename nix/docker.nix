@@ -1,21 +1,20 @@
 {
-  self,
-  ...
-}:
-{
   perSystem =
     {
       pkgs,
       lib,
       self',
+      packageFor,
       ...
     }:
     let
       version = self'.packages.default.version;
       imageName = "ghcr.io/paulmiro/immich-federation-at-home";
 
-      # Everything in the image comes from `targetPkgs`, including the `architecture` field
-      # dockerTools takes from its host platform, so image and binary always agree.
+      # Everything in the image comes from `targetPkgs`, including the binary itself and
+      # the `architecture` field dockerTools takes from its host platform, so image and
+      # binary always agree — and all of it is *cross*-compiled from the machine running
+      # the build, which therefore never has to be able to execute the target's code.
       imageFor =
         targetPkgs:
         targetPkgs.dockerTools.buildLayeredImage {
@@ -44,7 +43,7 @@
             chown -R 65532:65532 cache
           '';
           config = {
-            Entrypoint = [ (lib.getExe self.packages.${targetPkgs.stdenv.hostPlatform.system}.default) ];
+            Entrypoint = [ (lib.getExe (packageFor targetPkgs)) ];
             Env = [
               "SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt"
               "CACHE_DIR=/cache"

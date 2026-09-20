@@ -81,6 +81,13 @@
       immich-federation-at-home = packageFor pkgs;
     in
     {
+      # Handed to nix/docker.nix so an image can build *its own* binary for the
+      # architecture it is for. Reaching for `self.packages.<that system>.default`
+      # instead would pick the natively-built package of a foreign system, which needs
+      # a builder (or binfmt emulation) for that architecture — the whole point of
+      # going through pkgsCross is not to need one.
+      _module.args.packageFor = packageFor;
+
       packages.default = immich-federation-at-home;
 
       checks = {
