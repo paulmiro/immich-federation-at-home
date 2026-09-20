@@ -455,10 +455,14 @@ pub struct ConfigText<'a> {
 #[serde(deny_unknown_fields)]
 struct JobToml {
     export_album_url: Option<String>,
+    export_album_url_file: Option<String>,
+    export_album_url_env: Option<String>,
     export_album_password: Option<String>,
     export_album_password_file: Option<String>,
     export_album_password_env: Option<String>,
     import_server_url: Option<String>,
+    import_server_url_file: Option<String>,
+    import_server_url_env: Option<String>,
     import_api_key: Option<String>,
     import_api_key_file: Option<String>,
     import_api_key_env: Option<String>,
@@ -492,22 +496,29 @@ impl fmt::Display for SecretScope<'_> {
     }
 }
 
-/// Resolves one secret key's three spellings (`key`, `key_file`, `key_env`) in a single
-/// table. At most one may be set — two is a startup error naming the table and the key.
-/// Returns whether the *inline* spelling was the one used, since that's what
-/// [`warn_if_world_or_group_readable`] cares about.
+/// Resolves one key's three spellings (`key`, `key_file`, `key_env`) in a single table. At
+/// most one may be set — two is a startup error naming the table and the key. Returns
+/// whether the *inline* spelling was the one used; secret call sites feed that into
+/// [`warn_if_world_or_group_readable`]'s `used_inline_secret`, non-secret call sites (the URL
+/// keys) just discard it, since a URL isn't a credential and using it inline is never
+/// warned about.
+///
+/// Used for both actual secrets (`import_api_key`, `export_album_password`, wrapped in
+/// [`Secret`] by the caller) and the URL keys (`export_album_url`, `import_server_url`,
+/// which some users want to keep out of the config file itself) — the three-spelling
+/// machinery is identical either way, so there is exactly one copy of it.
 ///
 /// `_file` is read, and `_env` looked up through the injected `env`, right here — "read at
 /// startup" per `scratch/JOBS-DESIGN.md` — so a caller never needs to know which spelling
 /// won.
-fn resolve_secret_field(
+fn resolve_multi_spelling_field(
     scope: &SecretScope<'_>,
     key: &str,
     inline: Option<String>,
     file: Option<String>,
     env_var: Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<(Option<Secret>, bool)> {
+) -> Result<(Option<String>, bool)> {
     let spellings_set = [inline.is_some(), file.is_some(), env_var.is_some()]
         .into_iter()
         .filter(|set| *set)
@@ -520,29 +531,19 @@ fn resolve_secret_field(
     }
 
     if let Some(value) = inline {
-        return Ok((
-            Some(Secret::from_str(&value).unwrap_or_else(|e| match e {})),
-            true,
-        ));
+        return Ok((Some(value), true));
     }
     if let Some(path) = file {
         let path = PathBuf::from(path);
         let content = std::fs::read_to_string(&path)
             .with_context(|| format!("{scope}: could not read {key}_file at {}", path.display()))?;
-        let value = trim_trailing_newline(&content);
-        return Ok((
-            Some(Secret::from_str(value).unwrap_or_else(|e| match e {})),
-            false,
-        ));
+        return Ok((Some(trim_trailing_newline(&content).to_owned()), false));
     }
     if let Some(name) = env_var {
         let value = env(&name).ok_or_else(|| {
             anyhow!("{scope}: {key}_env names environment variable {name}, which is not set")
         })?;
-        return Ok((
-            Some(Secret::from_str(&value).unwrap_or_else(|e| match e {})),
-            false,
-        ));
+        return Ok((Some(value), false));
     }
     Ok((None, false))
 }
@@ -988,13 +989,11 @@ fn require_inherited(
     })
 }
 
-/// One secret key's inheritance: if the job sets *any* of its three spellings, resolve from
-/// the job alone — the top-level value, however it's spelled, is ignored entirely and never
-/// even read. Otherwise fall back to resolving the top-level default. This is "inheritance
-/// is per key, not per spelling" (`scratch/JOBS-DESIGN.md`), the one rule
-/// [`resolve_secret_field`] itself can't enforce since it only ever sees one table at a time.
+/// A required key resolved across its three spellings (`key`, `key_file`, `key_env`) and
+/// inherited from the top-level default — the URL keys' shape. Errors name all three
+/// spellings, unlike [`require_inherited`] (used for keys with no `_file`/`_env` variant).
 #[allow(clippy::too_many_arguments)]
-fn resolve_inherited_secret(
+fn require_inherited_multi_spelling(
     name: &str,
     key: &str,
     job_inline: Option<String>,
@@ -1004,9 +1003,46 @@ fn resolve_inherited_secret(
     default_file: Option<String>,
     default_env: Option<String>,
     env: &dyn Fn(&str) -> Option<String>,
-) -> Result<(Option<Secret>, bool)> {
+) -> Result<String> {
+    let (value, _) = resolve_inherited_multi_spelling(
+        name,
+        key,
+        job_inline,
+        job_file,
+        job_env,
+        default_inline,
+        default_file,
+        default_env,
+        env,
+    )?;
+    value.ok_or_else(|| {
+        anyhow!(
+            "job '{name}': {key} is required (set {key}, {key}_file, or {key}_env — in this \
+             job or as a top-level default)"
+        )
+    })
+}
+
+/// One key's inheritance across its three spellings: if the job sets *any* of them, resolve
+/// from the job alone — the top-level value, however it's spelled, is ignored entirely and
+/// never even read. Otherwise fall back to resolving the top-level default. This is
+/// "inheritance is per key, not per spelling" (`scratch/JOBS-DESIGN.md`), the one rule
+/// [`resolve_multi_spelling_field`] itself can't enforce since it only ever sees one table at
+/// a time.
+#[allow(clippy::too_many_arguments)]
+fn resolve_inherited_multi_spelling(
+    name: &str,
+    key: &str,
+    job_inline: Option<String>,
+    job_file: Option<String>,
+    job_env: Option<String>,
+    default_inline: Option<String>,
+    default_file: Option<String>,
+    default_env: Option<String>,
+    env: &dyn Fn(&str) -> Option<String>,
+) -> Result<(Option<String>, bool)> {
     if job_inline.is_some() || job_file.is_some() || job_env.is_some() {
-        resolve_secret_field(
+        resolve_multi_spelling_field(
             &SecretScope::Job(name),
             key,
             job_inline,
@@ -1015,7 +1051,7 @@ fn resolve_inherited_secret(
             env,
         )
     } else {
-        resolve_secret_field(
+        resolve_multi_spelling_field(
             &SecretScope::TopLevel,
             key,
             default_inline,
@@ -1037,18 +1073,29 @@ fn build_job_from_toml(
     defaults: &JobToml,
     env: &dyn Fn(&str) -> Option<String>,
 ) -> Result<(Job, bool)> {
-    let export_album_url = require_inherited(
+    let export_album_url = require_inherited_multi_spelling(
         name,
         "export_album_url",
         job.export_album_url.clone(),
+        job.export_album_url_file.clone(),
+        job.export_album_url_env.clone(),
         defaults.export_album_url.clone(),
+        defaults.export_album_url_file.clone(),
+        defaults.export_album_url_env.clone(),
+        env,
     )?;
-    let import_server_url = require_inherited(
+    let import_server_url = require_inherited_multi_spelling(
         name,
         "import_server_url",
         job.import_server_url.clone(),
+        job.import_server_url_file.clone(),
+        job.import_server_url_env.clone(),
         defaults.import_server_url.clone(),
+        defaults.import_server_url_file.clone(),
+        defaults.import_server_url_env.clone(),
+        env,
     )?;
+
     let import_album = require_inherited(
         name,
         "import_album",
@@ -1056,7 +1103,7 @@ fn build_job_from_toml(
         defaults.import_album.clone(),
     )?;
 
-    let (import_api_key, api_key_inline) = resolve_inherited_secret(
+    let (import_api_key, api_key_inline) = resolve_inherited_multi_spelling(
         name,
         "import_api_key",
         job.import_api_key.clone(),
@@ -1067,15 +1114,17 @@ fn build_job_from_toml(
         defaults.import_api_key_env.clone(),
         env,
     )?;
-    let import_api_key = import_api_key.ok_or_else(|| {
-        anyhow!(
-            "job '{name}': import_api_key is required (set import_api_key, \
-             import_api_key_file, or import_api_key_env — in this job or as a top-level \
-             default)"
-        )
-    })?;
+    let import_api_key = import_api_key
+        .map(|v| Secret::from_str(&v).unwrap_or_else(|e| match e {}))
+        .ok_or_else(|| {
+            anyhow!(
+                "job '{name}': import_api_key is required (set import_api_key, \
+                 import_api_key_file, or import_api_key_env — in this job or as a top-level \
+                 default)"
+            )
+        })?;
 
-    let (export_album_password, password_inline) = resolve_inherited_secret(
+    let (export_album_password, password_inline) = resolve_inherited_multi_spelling(
         name,
         "export_album_password",
         job.export_album_password.clone(),
@@ -1086,6 +1135,8 @@ fn build_job_from_toml(
         defaults.export_album_password_env.clone(),
         env,
     )?;
+    let export_album_password =
+        export_album_password.map(|v| Secret::from_str(&v).unwrap_or_else(|e| match e {}));
 
     let interval = resolve_duration(
         name,
@@ -1838,6 +1889,84 @@ mod tests {
         // override the inherited one, resolving the top-level default would fail here.
         let settings = load_file(&[], toml).unwrap();
         assert_eq!(settings.jobs[0].import_api_key.expose(), "job-inline-key");
+    }
+
+    // ---- URLs: same three spellings as secrets, minus the inline warning ------------------
+
+    #[test]
+    fn url_file_spelling_resolves_and_trims_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("export-url");
+        std::fs::write(&path, "https://export.example.com/s/abc\n").unwrap();
+
+        let toml = format!(
+            r#"
+            [jobs.family]
+            export_album_url_file = "{}"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+        "#,
+            path.display()
+        );
+        let settings = load_file(&[], &toml).unwrap();
+        assert_eq!(
+            settings.jobs[0].export_album_url,
+            "https://export.example.com/s/abc"
+        );
+    }
+
+    #[test]
+    fn url_env_spelling_resolves() {
+        let toml = r#"
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url_env = "FAMILY_IMPORT_SERVER_URL"
+            import_api_key = "k"
+            import_album = "Family Photos"
+        "#;
+        let env = env_map(&[("FAMILY_IMPORT_SERVER_URL", "https://import.example.com")]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let m = matches(&[]).unwrap();
+        let settings = load(&m, &lookup, Some(ConfigText { toml, path: None })).unwrap();
+        assert_eq!(
+            settings.jobs[0].import_server_url,
+            "https://import.example.com"
+        );
+    }
+
+    #[test]
+    fn two_url_spellings_in_one_job_is_an_error() {
+        let toml = r#"
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_server_url_env = "FAMILY_IMPORT_SERVER_URL"
+            import_api_key = "k"
+            import_album = "Family Photos"
+        "#;
+        assert!(load_file(&[], toml).is_err());
+    }
+
+    #[test]
+    fn job_overriding_an_inherited_url_spelling_uses_only_the_jobs_own() {
+        let toml = r#"
+            import_server_url_env = "TOP_LEVEL_IMPORT_SERVER_URL"
+
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+        "#;
+        // TOP_LEVEL_IMPORT_SERVER_URL deliberately left unset: if the job's own spelling
+        // didn't fully override the inherited one, resolving the top-level default would
+        // fail here.
+        let settings = load_file(&[], toml).unwrap();
+        assert_eq!(
+            settings.jobs[0].import_server_url,
+            "https://import.example.com"
+        );
     }
 
     // ---- tags: comma-separated flag/env, TOML array, merged (not overridden) default ------

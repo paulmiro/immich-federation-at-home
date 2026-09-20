@@ -23,28 +23,29 @@ in
       # Nix's usual camelCase): `settings` is rendered straight to TOML, so keeping the two
       # spellings identical means the option and the file it produces are obviously the same
       # thing, with no translation table to keep in your head.
-      secretOptions = secretName: {
-        ${secretName} = lib.mkOption (optionalStr ''
-          ${secretName}, inline. Puts it in the world-readable Nix store — prefer
-          `${secretName}_file` or `${secretName}_env`.
+      #
+      # Used for the two secrets (`export_album_password`, `import_api_key`) and, since
+      # they're an identical shape (one key, plus a `_file`/`_env` alternative that keeps it
+      # out of the world-readable Nix store), the two URL keys as well — a domain name isn't
+      # a credential, but some users still don't want it sitting in `settings`.
+      fileEnvOptions = optName: description: {
+        ${optName} = lib.mkOption (optionalStr ''
+          ${description} Puts it in the world-readable Nix store — prefer
+          `${optName}_file` or `${optName}_env`.
         '');
-        "${secretName}_file" = lib.mkOption (optionalStr ''
-          Path to read `${secretName}` from at startup (trailing newline trimmed). Point
+        "${optName}_file" = lib.mkOption (optionalStr ''
+          Path to read `${optName}` from at startup (trailing newline trimmed). Point
           it at a systemd `LoadCredential` (`%d/…`) or a sops-nix/agenix path. A plain
           string, not a Nix path, so a `%d/…` specifier isn't misread as a store path.
         '');
-        "${secretName}_env" = lib.mkOption (
-          optionalStr "Name of an environment variable holding `${secretName}`, read at startup."
+        "${optName}_env" = lib.mkOption (
+          optionalStr "Name of an environment variable holding `${optName}`, read at startup."
         );
       };
 
       # Shared by one job and by the top level, where the same keys act as the default for
       # every job that does not set them itself.
       jobOptions = {
-        export_album_url = lib.mkOption (optionalStr "Share link for the album to mirror.");
-        import_server_url = lib.mkOption (
-          optionalStr "Your own instance, e.g. `https://immich.example.com`."
-        );
         import_album = lib.mkOption (
           optionalStr "Target album: a UUID, or an exact, already-existing album name."
         );
@@ -65,8 +66,10 @@ in
           '';
         };
       }
-      // secretOptions "export_album_password"
-      // secretOptions "import_api_key";
+      // fileEnvOptions "export_album_url" "Share link for the album to mirror."
+      // fileEnvOptions "import_server_url" "Your own instance, e.g. `https://immich.example.com`."
+      // fileEnvOptions "export_album_password" "Password for the share link, if it has one."
+      // fileEnvOptions "import_api_key" "API key for the import instance.";
 
       settingsModule = lib.types.submodule {
         options = jobOptions // {
@@ -134,8 +137,8 @@ in
         }
       );
 
-      # A job's own spelling of a secret wins over the inherited one as a set of three, so
-      # "is it set here" is asked of a whole table, never of a single spelling.
+      # A job's own spelling of a three-spelling key wins over the inherited one as a set of
+      # three, so "is it set here" is asked of a whole table, never of a single spelling.
       secretSpellings =
         table: key:
         lib.count (v: v != null) [
@@ -146,31 +149,43 @@ in
       inheritedValue = job: key: if job.${key} != null then job.${key} else cfg.settings.${key};
       hasSecret = job: key: secretSpellings job key > 0 || secretSpellings cfg.settings key > 0;
 
+      # The two actual secrets — the only keys `warnings` below flags for landing inline in
+      # the world-readable Nix store. The URL keys accept the same `_file`/`_env` spellings
+      # (below, `multiSpellingKeys`) but aren't credentials, so using them inline is never
+      # warned about.
       secretKeys = [
         "export_album_password"
         "import_api_key"
+      ];
+
+      # Every key that accepts the `key`/`key_file`/`key_env` trio — the secrets, plus the
+      # two URL keys some users want to keep out of `settings` for privacy rather than
+      # secrecy.
+      multiSpellingKeys = secretKeys ++ [
+        "export_album_url"
+        "import_server_url"
       ];
 
       jobAssertions =
         jobName: job:
         map
           (key: {
-            assertion = inheritedValue job key != null;
+            assertion = hasSecret job key;
             message =
-              "services.${name}.settings.jobs.${jobName}.${key} is not set, and neither is the "
-              + "default in services.${name}.settings.${key}.";
+              "services.${name}.settings.jobs.${jobName} has no ${key}, ${key}_file or "
+              + "${key}_env, and neither does services.${name}.settings.";
           })
           [
             "export_album_url"
             "import_server_url"
-            "import_album"
+            "import_api_key"
           ]
         ++ [
           {
-            assertion = hasSecret job "import_api_key";
+            assertion = inheritedValue job "import_album" != null;
             message =
-              "services.${name}.settings.jobs.${jobName} has no import_api_key, import_api_key_file "
-              + "or import_api_key_env, and neither does services.${name}.settings.";
+              "services.${name}.settings.jobs.${jobName}.import_album is not set, and neither "
+              + "is the default in services.${name}.settings.import_album.";
           }
         ]
         ++ map (key: {
@@ -178,7 +193,7 @@ in
           message =
             "services.${name}.settings.jobs.${jobName} sets ${key} more than once — use only one "
             + "of ${key}, ${key}_file or ${key}_env.";
-        }) secretKeys;
+        }) multiSpellingKeys;
     in
     {
       options.services.${name} = {
@@ -217,10 +232,11 @@ in
             Keys set next to {option}`jobs` are the default for every job that does not set
             them itself.
 
-            Secrets put here directly land in the world-readable Nix store: prefer the
-            `_file` spelling of each (pointing at a systemd `LoadCredential` or a
-            sops-nix/agenix path), or `_env` together with
-            {option}`services.${name}.environmentFile`.
+            Secrets — and, for those who'd rather not have a domain name sitting in the Nix
+            store either, {option}`export_album_url`/{option}`import_server_url` — put here
+            directly land in the world-readable Nix store: prefer the `_file` spelling of
+            each (pointing at a systemd `LoadCredential` or a sops-nix/agenix path), or
+            `_env` together with {option}`services.${name}.environmentFile`.
           '';
         };
 
@@ -247,7 +263,7 @@ in
           message =
             "services.${name}.settings sets ${key} more than once — use only one of ${key}, "
             + "${key}_file or ${key}_env.";
-        }) secretKeys
+        }) multiSpellingKeys
         ++ lib.concatLists (lib.mapAttrsToList jobAssertions cfg.settings.jobs);
 
         warnings =

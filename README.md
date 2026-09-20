@@ -145,10 +145,12 @@ full config format, including secrets and precedence.
 
 `settings` mirrors the config file one-to-one, so `nix eval` on it and the file the service
 reads say the same thing — see [Running several jobs in one
-process](#running-several-jobs-in-one-process) for the full format. Secrets can also be read
-from a file at startup with the `_file` spelling of each key (`import_api_key_file`,
-`export_album_password_file`), pointing at a systemd `LoadCredential` or a sops-nix/agenix
-path.
+process](#running-several-jobs-in-one-process) for the full format. Secrets, and the two URL
+keys, can also be read from a file at startup with the `_file` spelling of each key
+(`import_api_key_file`, `export_album_password_file`, `export_album_url_file`,
+`import_server_url_file`), pointing at a systemd `LoadCredential` or a sops-nix/agenix
+path — worth it for the URLs too, since `settings` above is rendered straight into the Nix
+store, which is world-readable.
 
 ## Running the binary directly
 
@@ -203,9 +205,9 @@ level as a default for every job:
 
 | Variable                | Default | Meaning                                                                                 |
 | ----------------------- | ------- | ---------------------------------------------------------------------------------------- |
-| `EXPORT_ALBUM_URL`      | -       | Share link for the album to mirror. Sub-path deployments and trailing slashes are fine. |
+| `EXPORT_ALBUM_URL`      | -       | Share link for the album to mirror. Sub-path deployments and trailing slashes are fine. Also `_file`/`_env` in a config file. |
 | `EXPORT_ALBUM_PASSWORD` | unset   | Password for the share link, if it has one.                                             |
-| `IMPORT_SERVER_URL`     | -       | Your own instance, e.g. `https://immich.example.com`. A trailing `/` or `/api` is fine. |
+| `IMPORT_SERVER_URL`     | -       | Your own instance, e.g. `https://immich.example.com`. A trailing `/` or `/api` is fine. Also `_file`/`_env` in a config file. |
 | `IMPORT_API_KEY`        | -       | API key for the import instance; see [Setup](#setup).                                   |
 | `IMPORT_ALBUM`          | -       | Target album: a UUID, or an exact album name. It must already exist.                    |
 | `INTERVAL`              | `1h`    | How often to check for new assets (`30m`, `1h30m`, `6h`, …).                            |
@@ -263,6 +265,11 @@ variant (a path, read at startup) and a `*_env` variant (the name of an environm
 variable, read at startup) — exactly one spelling per key per job. `*_file` is what makes
 Docker secrets, systemd `LoadCredential`, sops-nix and agenix work. Startup warns if a
 config file holding an inline secret is group- or world-readable.
+
+**URLs.** `export_album_url` and `import_server_url` accept the same `*_file`/`*_env` pair,
+for keeping a domain name out of the config file itself — handy since the config isn't
+always private (a Nix store path, say). No warning applies to these two; a URL isn't a
+credential.
 
 **Merging albums.** Two jobs may deliberately target the same `import_album` — that's the
 supported way to merge several source albums into one.
