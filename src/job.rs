@@ -111,6 +111,7 @@ mod tests {
             interval: std::time::Duration::from_secs(3600),
             request_timeout: std::time::Duration::from_secs(5),
             transfer_timeout: std::time::Duration::from_secs(5),
+            tags: Vec::new(),
         }
     }
 

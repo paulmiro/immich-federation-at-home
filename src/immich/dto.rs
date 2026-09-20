@@ -388,6 +388,52 @@ pub struct BulkIdResponseDto {
 }
 
 // ---------------------------------------------------------------------------------------
+// Tags — PUT /tags (upsert-by-name, create-or-get) and PUT /tags/assets (bulk attach)
+// ---------------------------------------------------------------------------------------
+
+/// `TagUpsertDto` — the upsert-tags request body, `{"tags": [...]}`. `jq
+/// '.components.schemas.TagUpsertDto'` → `{tags: string[]}`, required. Each string is a tag
+/// *value* (its full path, `"Parent/Child"` for a nested tag) — the server creates whatever
+/// doesn't already exist by that value and returns every one of them, existing or freshly
+/// created alike, in [`TagResponseDto`].
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagUpsertDto {
+    pub tags: Vec<String>,
+}
+
+/// The subset of `TagResponseDto` this tool needs. `jq
+/// '.components.schemas.TagResponseDto'` → `required: [createdAt, id, name, updatedAt,
+/// value]`. `value` (not `name`) is what round-trips against what was sent to
+/// [`TagUpsertDto`] — `name` is only the leaf segment of a nested tag's path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagResponseDto {
+    pub id: Uuid,
+    pub value: String,
+}
+
+/// `TagBulkAssetsDto` — the bulk-tag request body, `PUT /tags/assets`. `jq
+/// '.components.schemas.TagBulkAssetsDto'` → `{assetIds: uuid[], tagIds: uuid[]}`, both
+/// required — every asset in `asset_ids` gets every tag in `tag_ids` (a cross product), in
+/// one request.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBulkAssetsDto {
+    pub tag_ids: Vec<Uuid>,
+    pub asset_ids: Vec<Uuid>,
+}
+
+/// `jq '.components.schemas.TagBulkAssetsResponseDto'` → `{count: integer}`, required. No
+/// per-item outcome (unlike I6's `BulkIdResponseDto`) — tagging an asset that already has the
+/// tag is simply idempotent server-side, so there's nothing finer-grained to report.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TagBulkAssetsResponseDto {
+    pub count: u64,
+}
+
+// ---------------------------------------------------------------------------------------
 // I2 — GET /api-keys/me
 // ---------------------------------------------------------------------------------------
 
@@ -419,14 +465,21 @@ pub const PERMISSION_ASSET_UPLOAD: &str = "asset.upload";
 pub const PERMISSION_ALBUM_READ: &str = "album.read";
 /// Needed for I6 — `PUT /albums/{id}/assets`.
 pub const PERMISSION_ALBUM_ASSET_CREATE: &str = "albumAsset.create";
+/// Needed to create a configured tag that doesn't already exist — `PUT /tags`.
+pub const PERMISSION_TAG_CREATE: &str = "tag.create";
+/// Needed to attach a configured tag to a synced asset — `PUT /tags/assets`.
+pub const PERMISSION_TAG_ASSET: &str = "tag.asset";
 
 /// The exact permission set `PLAN.md` §5 step 8 requires the import API key to have (or
-/// `all`).
+/// `all`) — every job needs these, regardless of whether it configures tags.
 pub const REQUIRED_PERMISSIONS: [&str; 3] = [
     PERMISSION_ASSET_UPLOAD,
     PERMISSION_ALBUM_READ,
     PERMISSION_ALBUM_ASSET_CREATE,
 ];
+
+/// Additionally required only by a job that configures at least one tag.
+pub const TAG_PERMISSIONS: [&str; 2] = [PERMISSION_TAG_CREATE, PERMISSION_TAG_ASSET];
 
 impl ApiKeyResponseDto {
     /// Returns the subset of `required` this key does *not* have, honouring the `all`
@@ -863,6 +916,41 @@ mod tests {
             serde_json::to_string(&dto).unwrap(),
             r#"{"ids":["3fa85f64-5717-4562-b3fc-2c963f66afa6"]}"#
         );
+    }
+
+    // ---- Tags: TagUpsertDto / TagResponseDto / TagBulkAssetsDto ------------------------
+
+    #[test]
+    fn tag_upsert_dto_serializes() {
+        let dto = TagUpsertDto {
+            tags: vec!["Family".to_owned(), "Holiday/2026".to_owned()],
+        };
+        assert_eq!(
+            serde_json::to_string(&dto).unwrap(),
+            r#"{"tags":["Family","Holiday/2026"]}"#
+        );
+    }
+
+    #[test]
+    fn tag_response_dto_deserializes_by_value() {
+        let json = r##"[
+            {"id": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "name": "Family", "value": "Family", "color": "#ffffff", "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z"},
+            {"id": "9c858901-8a57-4791-81fe-4c455b099bc9", "name": "2026", "value": "Holiday/2026", "parentId": "3fa85f64-5717-4562-b3fc-2c963f66afa6", "createdAt": "2024-01-01T00:00:00.000Z", "updatedAt": "2024-01-01T00:00:00.000Z"}
+        ]"##;
+        let tags: Vec<TagResponseDto> = serde_json::from_str(json).unwrap();
+        assert_eq!(tags[0].value, "Family");
+        assert_eq!(tags[1].value, "Holiday/2026");
+    }
+
+    #[test]
+    fn tag_bulk_assets_dto_serializes() {
+        let dto = TagBulkAssetsDto {
+            tag_ids: vec![Uuid::parse_str("3fa85f64-5717-4562-b3fc-2c963f66afa6").unwrap()],
+            asset_ids: vec![Uuid::parse_str("9c858901-8a57-4791-81fe-4c455b099bc9").unwrap()],
+        };
+        let value: serde_json::Value = serde_json::to_value(&dto).unwrap();
+        assert_eq!(value["tagIds"][0], "3fa85f64-5717-4562-b3fc-2c963f66afa6");
+        assert_eq!(value["assetIds"][0], "9c858901-8a57-4791-81fe-4c455b099bc9");
     }
 
     // ---- ApiKeyResponseDto / permission subset-check -----------------------------------

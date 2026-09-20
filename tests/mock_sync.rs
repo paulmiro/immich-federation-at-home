@@ -391,6 +391,7 @@ impl MockServer {
             Arc::new(ContentHashCache::disabled()),
             Arc::new(Semaphore::new(4)),
             None,
+            Vec::new(),
         )
     }
 }
@@ -469,6 +470,7 @@ fn job_config(name: &str, export: &Url, import: &Url, import_album: Uuid) -> Job
         interval: Duration::from_secs(3600),
         request_timeout: Duration::from_secs(5),
         transfer_timeout: Duration::from_secs(5),
+        tags: Vec::new(),
     }
 }
 

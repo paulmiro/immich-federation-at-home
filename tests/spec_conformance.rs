@@ -8,8 +8,8 @@
 //!   both directions (every spec literal deserializes to a *named* variant of ours, not the
 //!   `Unrecognized` catch-all; every literal our types accept is one the spec actually
 //!   defines);
-//! * the three permission strings in `dto::REQUIRED_PERMISSIONS`, plus the `all` wildcard,
-//!   are real members of the spec's `Permission` enum.
+//! * the three permission strings in `dto::REQUIRED_PERMISSIONS`, plus the `all` wildcard and
+//!   `dto::TAG_PERMISSIONS`, are real members of the spec's `Permission` enum.
 //!
 //! Every JSON path below was confirmed with `jq` against the vendored spec before being
 //! written here (see `NOTES.md`'s "Task 12" section for the exact queries), per this task's
@@ -260,6 +260,28 @@ fn api_key_response_dto_required_fields() {
     assert_required("ApiKeyResponseDto", &["id", "name", "permissions"]);
 }
 
+#[test]
+fn tag_upsert_dto_required_fields() {
+    assert_required("TagUpsertDto", &["tags"]);
+}
+
+#[test]
+fn tag_response_dto_required_fields() {
+    // dto::TagResponseDto only models id/value, both non-Option; name/createdAt/updatedAt
+    // are spec-required too but simply not modelled here (nothing downstream needs them).
+    assert_required("TagResponseDto", &["id", "value"]);
+}
+
+#[test]
+fn tag_bulk_assets_dto_required_fields() {
+    assert_required("TagBulkAssetsDto", &["tagIds", "assetIds"]);
+}
+
+#[test]
+fn tag_bulk_assets_response_dto_required_fields() {
+    assert_required("TagBulkAssetsResponseDto", &["count"]);
+}
+
 // -----------------------------------------------------------------------------------------
 // Enum literal conformance — every wire string dto.rs's enums accept, checked against the
 // spec's `enum` array in both directions: every spec literal must deserialize to a *named*
@@ -426,4 +448,15 @@ fn required_permissions_are_real_spec_permissions() {
         spec_permissions.contains(dto::PERMISSION_ALL),
         "the \"all\" wildcard is not a member of the spec's Permission enum any more"
     );
+}
+
+#[test]
+fn tag_permissions_are_real_spec_permissions() {
+    let spec_permissions = spec_enum_values("Permission");
+    for permission in dto::TAG_PERMISSIONS {
+        assert!(
+            spec_permissions.contains(permission),
+            "{permission:?} is not a member of the spec's Permission enum any more"
+        );
+    }
 }

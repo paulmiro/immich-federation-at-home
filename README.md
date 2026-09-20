@@ -23,6 +23,7 @@ On the **import** instance, create the target album (it is **not** created for y
 - `asset.upload`
 - `album.read` 
 - `albumAsset.create`
+- `tag.create` and `tag.asset` — only if you configure `TAGS`/`tags` (see below)
 
 ## Docker Compose
 
@@ -210,6 +211,7 @@ level as a default for every job:
 | `INTERVAL`              | `1h`    | How often to check for new assets (`30m`, `1h30m`, `6h`, …).                            |
 | `REQUEST_TIMEOUT`       | `30s`   | Timeout for metadata calls.                                                             |
 | `TRANSFER_TIMEOUT`      | `30m`   | Timeout for transferring a single asset.                                                |
+| `TAGS`                  | unset   | Comma-separated tags to attach to every synced asset. Created if they don't exist yet.   |
 
 `RUN_ONCE`/`--once` (`true`/`false` only, default `false`) does one pass over every job and
 exits, non-zero if any job failed. It's an invocation mode for the whole process, not a
@@ -253,7 +255,8 @@ import_album     = "Family Photos" # same album as `family`, deliberately
 
 **Precedence.** Process-global keys: flag > file > env > default. Job keys: job table >
 top-level default > built-in default — environment variables never reach into jobs once a
-file exists.
+file exists. `tags` is the one exception to that "job table beats top-level default" rule —
+see **Tags** below.
 
 **Secrets.** `import_api_key` and `export_album_password` each also accept a `*_file`
 variant (a path, read at startup) and a `*_env` variant (the name of an environment
@@ -263,6 +266,21 @@ config file holding an inline secret is group- or world-readable.
 
 **Merging albums.** Two jobs may deliberately target the same `import_album` — that's the
 supported way to merge several source albums into one.
+
+**Tags.** `tags` (a comma-separated list via `TAGS`/`--tags`, or an array of strings via the
+TOML `tags` key) attaches one or more tags to every asset a job adds to its target album,
+creating any tag that doesn't already exist on the import instance yet. Unlike every other
+job key, a top-level `tags` default is *merged into*, never overridden by, each job's own
+`tags` — the combined list is deduplicated, so:
+
+```toml
+tags = ["Mirrored"]              # every job also gets this tag
+
+[jobs.family]
+export_album_url = "https://their-immich.example.com/s/some-shared-album"
+import_album     = "Family Photos"
+tags             = ["Family"]    # this job's assets end up tagged Mirrored *and* Family
+```
 
 **Concurrency.** `transfer_concurrency` is process-wide; there is no per-job knob. A job
 that needs to be gentle with a slow export server uses a longer `interval` instead.
@@ -277,10 +295,10 @@ if any job failed.
 ## What gets synced
 
 Every run lists the source album and asks your instance which of those checksums it already
-has. Only the missing ones are transferred; all of them are then added to the target album.
-Nothing is remembered between runs, so there is no database to back up and no state to
-corrupt — but permanently deleting an imported asset means the next run brings it back.
-(Assets in your trash are recognised and left alone.)
+has. Only the missing ones are transferred; all of them are then added to the target album
+and, if `tags` is configured, tagged. Nothing is remembered between runs, so there is no
+database to back up and no state to corrupt — but permanently deleting an imported asset
+means the next run brings it back. (Assets in your trash are recognised and left alone.)
 
 The exception is assets that live in an **external library** on the export side. Immich
 identifies those by their path rather than their contents, so their checksum is useless for

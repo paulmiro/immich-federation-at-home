@@ -34,6 +34,11 @@ pub const BULK_CHECK_CHUNK_SIZE: usize = 500;
 /// `PLAN.md` §6 step 4: `PUT /albums/{id}/assets` is chunked into groups of this size.
 pub const ALBUM_ADD_CHUNK_SIZE: usize = 500;
 
+/// `PUT /tags/assets` is chunked into groups of this many asset ids, same reasoning (and
+/// same size) as [`ALBUM_ADD_CHUNK_SIZE`] — the spec sets no documented limit, but sending
+/// an unbounded array in one request is the same footgun either way.
+pub const TAG_ASSETS_CHUNK_SIZE: usize = 500;
+
 /// Everything that can go wrong on the import side, beyond a plain [`ApiError`]. Kept
 /// distinct so callers (`main.rs`, `sync.rs` — later steps) can match on import-specific,
 /// actionable cases (album resolution failures, a local file-open failure) without parsing
@@ -495,6 +500,49 @@ impl ImportClient {
         }
 
         Ok(outcome)
+    }
+
+    /// Tag setup, run once at job startup (`startup.rs`): `PUT /tags`, create-or-get by
+    /// value. Every name in `tags` that doesn't already exist on the import instance is
+    /// created; every one, new or pre-existing, comes back with its id. Never chunked — a
+    /// job's own configured tag list is expected to be small (unlike the per-run asset ids
+    /// chunked elsewhere in this file), and the endpoint itself only takes tag names, not one
+    /// entry per asset.
+    pub async fn upsert_tags(&self, tags: &[String]) -> Result<Vec<dto::TagResponseDto>, ApiError> {
+        let url = self.url("/tags");
+        let body = dto::TagUpsertDto {
+            tags: tags.to_vec(),
+        };
+        send_json(&self.retry_policy, "upsert_tags", Method::PUT, &url, || {
+            self.metadata_client.put(url.clone()).json(&body)
+        })
+        .await
+    }
+
+    /// `PUT /tags/assets`, chunked into groups of [`TAG_ASSETS_CHUNK_SIZE`] asset ids (every
+    /// chunk still carries the *whole* `tag_ids`, since one request tags every asset in it
+    /// with every tag in it — a cross product, not a per-tag call). Idempotent server-side:
+    /// an asset that already carries a tag is simply a no-op for that pair, with no
+    /// per-item outcome to report (unlike I6's `add_assets_to_album`) — just a running total
+    /// count, summed across chunks.
+    pub async fn tag_assets(&self, tag_ids: &[Uuid], asset_ids: &[Uuid]) -> Result<u64, ApiError> {
+        let url = self.url("/tags/assets");
+        let mut total: u64 = 0;
+
+        for chunk in asset_ids.chunks(TAG_ASSETS_CHUNK_SIZE) {
+            let body = dto::TagBulkAssetsDto {
+                tag_ids: tag_ids.to_vec(),
+                asset_ids: chunk.to_vec(),
+            };
+            let response: dto::TagBulkAssetsResponseDto =
+                send_json(&self.retry_policy, "tag_assets", Method::PUT, &url, || {
+                    self.metadata_client.put(url.clone()).json(&body)
+                })
+                .await?;
+            total += response.count;
+        }
+
+        Ok(total)
     }
 }
 
@@ -1084,6 +1132,71 @@ mod tests {
         let outcome = import.add_assets_to_album(album_id, &ids).await.unwrap();
 
         assert_eq!(outcome.added.len(), 750);
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
+
+    // ---- Tags: upsert_tags / tag_assets ------------------------------------------------
+
+    #[tokio::test]
+    async fn upsert_tags_creates_or_gets_by_value() {
+        let app = Router::new().route(
+            "/tags",
+            put(|Json(body): Json<serde_json::Value>| async move {
+                let tags = body["tags"].as_array().cloned().unwrap_or_default();
+                let results: Vec<_> = tags
+                    .iter()
+                    .enumerate()
+                    .map(|(i, name)| {
+                        json!({
+                            "id": Uuid::from_u128(i as u128 + 1).to_string(),
+                            "name": name,
+                            "value": name,
+                            "createdAt": "2024-01-01T00:00:00.000Z",
+                            "updatedAt": "2024-01-01T00:00:00.000Z"
+                        })
+                    })
+                    .collect();
+                Json(results)
+            }),
+        );
+        let (base, _server) = spawn_test_server(Router::new().nest("/api", app)).await;
+        let import = client(&base);
+
+        let tags = import
+            .upsert_tags(&["Family".to_owned(), "Holiday/2026".to_owned()])
+            .await
+            .unwrap();
+        assert_eq!(tags.len(), 2);
+        assert_eq!(tags[0].value, "Family");
+        assert_eq!(tags[1].value, "Holiday/2026");
+    }
+
+    #[tokio::test]
+    async fn tag_assets_sums_counts_across_chunks() {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_handler = calls.clone();
+        let app = Router::new().route(
+            "/tags/assets",
+            put(move |Json(body): Json<serde_json::Value>| {
+                let calls = calls_for_handler.clone();
+                async move {
+                    calls.fetch_add(1, Ordering::SeqCst);
+                    let asset_ids = body["assetIds"].as_array().cloned().unwrap_or_default();
+                    assert!(asset_ids.len() <= TAG_ASSETS_CHUNK_SIZE);
+                    Json(json!({"count": asset_ids.len()}))
+                }
+            }),
+        );
+        let (base, _server) = spawn_test_server(Router::new().nest("/api", app)).await;
+        let import = client(&base);
+
+        let tag_ids = vec![Uuid::parse_str("3fa85f64-5717-4562-b3fc-2c963f66afa6").unwrap()];
+        let asset_ids: Vec<Uuid> = (0..750u32)
+            .map(|i| Uuid::from_u128(u128::from(i) + 1))
+            .collect();
+
+        let count = import.tag_assets(&tag_ids, &asset_ids).await.unwrap();
+        assert_eq!(count, 750);
         assert_eq!(calls.load(Ordering::SeqCst), 2);
     }
 }

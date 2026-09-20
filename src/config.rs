@@ -86,6 +86,42 @@ fn parse_duration(raw: &str) -> std::result::Result<Duration, String> {
     })
 }
 
+/// Trims every tag, drops any that end up empty, and deduplicates by exact string equality
+/// (case-sensitive — Immich tag values are), keeping the first occurrence of a repeat. Used
+/// both to parse a single comma-separated `--tags`/`TAGS` value and to clean up a TOML
+/// `tags` array before it's merged with another list — see [`merge_tags`].
+fn normalize_tags(tags: impl IntoIterator<Item = impl Into<String>>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    tags.into_iter()
+        .map(Into::into)
+        .map(|t| t.trim().to_owned())
+        .filter(|t| !t.is_empty())
+        .filter(|t| seen.insert(t.clone()))
+        .collect()
+}
+
+/// `clap`/env value parser for `--tags`/`TAGS`: a comma-separated list, per the README —
+/// TOML's own `tags = [...]` array skips this entirely and goes straight to
+/// [`normalize_tags`] on the already-split `Vec<String>` serde produces. Always `Ok`
+/// (there's no input this can reject) — still `Result`-shaped because that's what `clap`'s
+/// `value_parser = <path>` attribute requires of a plain function, the same reason
+/// [`parse_duration`] returns one for a case that actually can fail.
+#[allow(clippy::unnecessary_wraps)]
+fn parse_tag_list(raw: &str) -> std::result::Result<Vec<String>, String> {
+    Ok(normalize_tags(raw.split(',')))
+}
+
+/// The "default" tags list (top-level default, however it was sourced) is *merged with*,
+/// never overridden by, each job's own tags — the one job key that doesn't follow "job >
+/// default > built-in default" (`default` here is already `normalize_tags`-clean; `job_own`
+/// is normalized here since it comes straight from a TOML array with no chance to have gone
+/// through [`parse_tag_list`] yet). Order is default-first, then the job's own additions, so
+/// the default set reads first in the resulting job's tag list and in any log line built from
+/// it.
+fn merge_tags(default: &[String], job_own: &[String]) -> Vec<String> {
+    normalize_tags(default.iter().chain(job_own.iter()).cloned())
+}
+
 // =============================================================================================
 // Resolved configuration: what the rest of the program runs on.
 // =============================================================================================
@@ -104,6 +140,10 @@ pub struct Job {
     pub interval: Duration,
     pub request_timeout: Duration,
     pub transfer_timeout: Duration,
+    /// Tags to attach to every asset this job adds to the target album. Trimmed,
+    /// empty-string-filtered, and deduplicated already (see [`normalize_tags`]) — never
+    /// re-normalized downstream. Empty means "don't tag anything", the default.
+    pub tags: Vec<String>,
 }
 
 impl Job {
@@ -290,6 +330,13 @@ pub struct Cli {
     #[arg(long)]
     pub import_album: Option<String>,
 
+    /// Comma-separated tags to attach to every synced asset. Created on the import instance
+    /// if they don't already exist. Also settable as `TAGS`. Ignored if a config file is in
+    /// use — set it there instead, per job or as a top-level default (merged with, not
+    /// overridden by, each job's own).
+    #[arg(long, value_parser = parse_tag_list)]
+    pub tags: Option<Vec<String>>,
+
     /// How often to check the export album for new assets, as a `humantime` duration (e.g.
     /// `30m`, `1h30m`, `6h`). Also settable as `INTERVAL`, or (compatibility only)
     /// `IMPORT_INTERVAL` — setting both is a startup error. Ignored if a config file is in
@@ -422,6 +469,11 @@ struct JobToml {
     interval: Option<String>,
     request_timeout: Option<String>,
     transfer_timeout: Option<String>,
+    /// Unlike every other field here, a job's own `tags` is *merged with* — never
+    /// overridden by — the top-level default of the same name; see [`merge_tags`] and
+    /// [`build_job_from_toml`].
+    #[serde(default)]
+    tags: Vec<String>,
 }
 
 /// Which table a secret-resolution or required-key error happened in, so the message names
@@ -765,6 +817,7 @@ pub fn load(
 /// unchanged in behaviour from today's single-job tool. Every key here follows **flag >
 /// env > default** (`interval` additionally accepting its old spelling), since there is no
 /// file to fall back to.
+#[allow(clippy::too_many_lines)]
 fn build_implicit_job(
     matches: &clap::ArgMatches,
     env: &dyn Fn(&str) -> Option<String>,
@@ -859,6 +912,11 @@ fn build_implicit_job(
             None,
             Duration::from_secs(30 * 60),
         )?,
+        // No config file, so there's only ever this one job — --tags/TAGS *is* the whole
+        // tags list, already `normalize_tags`-clean via `parse_tag_list`, with nothing else
+        // to merge it against.
+        tags: resolve_optional::<Vec<String>>(matches, "tags", env, "TAGS", parse_tag_list, None)?
+            .unwrap_or_default(),
     };
     job.validate()?;
     Ok(job)
@@ -1051,6 +1109,9 @@ fn build_job_from_toml(
         "30m",
     )?;
 
+    // The one job key that's merged rather than overridden — see `merge_tags`'s doc comment.
+    let tags = merge_tags(&defaults.tags, &job.tags);
+
     let job = Job {
         name: name.to_owned(),
         export_album_url,
@@ -1061,6 +1122,7 @@ fn build_job_from_toml(
         interval,
         request_timeout,
         transfer_timeout,
+        tags,
     };
     job.validate()?;
     Ok((job, api_key_inline || password_inline))
@@ -1776,5 +1838,108 @@ mod tests {
         // override the inherited one, resolving the top-level default would fail here.
         let settings = load_file(&[], toml).unwrap();
         assert_eq!(settings.jobs[0].import_api_key.expose(), "job-inline-key");
+    }
+
+    // ---- tags: comma-separated flag/env, TOML array, merged (not overridden) default ------
+
+    #[test]
+    fn no_file_tags_default_to_empty() {
+        let settings = load_no_file(&[]).unwrap();
+        assert!(settings.jobs[0].tags.is_empty());
+    }
+
+    #[test]
+    fn no_file_tags_flag_splits_on_comma_trims_and_dedupes() {
+        let settings = load_no_file(&["--tags", " Family , Holiday, Family ,"]).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["Family", "Holiday"]);
+    }
+
+    #[test]
+    fn no_file_tags_env_var_works() {
+        let env = env_map(&[("TAGS", "a,b")]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let settings = load_with_env(&[], &lookup).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["a", "b"]);
+    }
+
+    #[test]
+    fn file_job_tags_array_is_used() {
+        let toml = r#"
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+            tags = ["Family", "Friends"]
+        "#;
+        let settings = load_file(&[], toml).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["Family", "Friends"]);
+    }
+
+    #[test]
+    fn file_top_level_default_tags_are_merged_with_not_overridden_by_the_jobs_own() {
+        let toml = r#"
+            tags = ["Everyone"]
+
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+            tags = ["Family"]
+        "#;
+        let settings = load_file(&[], toml).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["Everyone", "Family"]);
+    }
+
+    #[test]
+    fn file_merged_tags_are_deduplicated() {
+        let toml = r#"
+            tags = ["Everyone"]
+
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+            tags = ["Everyone", "Family"]
+        "#;
+        let settings = load_file(&[], toml).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["Everyone", "Family"]);
+    }
+
+    #[test]
+    fn file_job_with_no_tags_still_gets_the_top_level_default() {
+        let toml = r#"
+            tags = ["Everyone"]
+
+            [jobs.family]
+            export_album_url = "https://export.example.com/s/abc"
+            import_server_url = "https://import.example.com"
+            import_api_key = "k"
+            import_album = "Family Photos"
+        "#;
+        let settings = load_file(&[], toml).unwrap();
+        assert_eq!(settings.jobs[0].tags, vec!["Everyone"]);
+    }
+
+    #[test]
+    fn file_mode_tags_env_var_does_not_reach_into_jobs() {
+        // Once a config file is in play, TAGS (like every other per-job environment
+        // variable) is ignored — the file is the whole tags story, top-level default and
+        // job's own array alike.
+        let env = env_map(&[("TAGS", "FromEnv")]);
+        let lookup = |k: &str| env.get(k).cloned();
+        let m = matches(&[]).unwrap();
+        let settings = load(
+            &m,
+            &lookup,
+            Some(ConfigText {
+                toml: MINIMAL_JOB_TOML,
+                path: None,
+            }),
+        )
+        .unwrap();
+        assert!(settings.jobs[0].tags.is_empty());
     }
 }

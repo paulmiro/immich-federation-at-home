@@ -22,6 +22,7 @@
 //! `job::JobRunner::tick` calls; everything else in this module is a smaller piece it
 //! composes, each independently unit tested below.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::Context;
@@ -181,11 +182,17 @@ pub fn assert_shared_link(
 // API key permission check (§5 step 8, I2)
 // ---------------------------------------------------------------------------------------
 
-/// §5 step 8 (I2): requires [`dto::REQUIRED_PERMISSIONS`] ⊆ the key's own permissions (or
-/// the `all` wildcard — see [`dto::ApiKeyResponseDto::missing_permissions`]), failing with
-/// *exactly* the missing permissions named, never a generic "insufficient permissions".
-pub fn check_api_key_permissions(key: &dto::ApiKeyResponseDto) -> anyhow::Result<()> {
-    let missing = key.missing_permissions(&dto::REQUIRED_PERMISSIONS);
+/// §5 step 8 (I2): requires `required` ⊆ the key's own permissions (or the `all` wildcard —
+/// see [`dto::ApiKeyResponseDto::missing_permissions`]), failing with *exactly* the missing
+/// permissions named, never a generic "insufficient permissions". `required` is
+/// [`dto::REQUIRED_PERMISSIONS`] plus, for a job that configures at least one tag,
+/// [`dto::TAG_PERMISSIONS`] — see [`required_permissions_for`] — so a job with no tags
+/// configured never has to grant `tag.create`/`tag.asset` just to run.
+pub fn check_api_key_permissions(
+    key: &dto::ApiKeyResponseDto,
+    required: &[&'static str],
+) -> anyhow::Result<()> {
+    let missing = key.missing_permissions(required);
     if !missing.is_empty() {
         anyhow::bail!(
             "IMPORT_API_KEY is missing the following permission(s): {}. On the import instance, \
@@ -194,6 +201,65 @@ pub fn check_api_key_permissions(key: &dto::ApiKeyResponseDto) -> anyhow::Result
         );
     }
     Ok(())
+}
+
+/// The exact permission set [`check_api_key_permissions`] requires for `job`:
+/// [`dto::REQUIRED_PERMISSIONS`] always, plus [`dto::TAG_PERMISSIONS`] only when the job
+/// configures at least one tag — tagging is entirely optional, so a job that doesn't use it
+/// should never be forced to grant `tag.create`/`tag.asset` on its API key.
+fn required_permissions_for(job: &Job) -> Vec<&'static str> {
+    let mut required = dto::REQUIRED_PERMISSIONS.to_vec();
+    if !job.tags.is_empty() {
+        required.extend(dto::TAG_PERMISSIONS);
+    }
+    required
+}
+
+// ---------------------------------------------------------------------------------------
+// Tag resolution (create-or-get, once per job)
+// ---------------------------------------------------------------------------------------
+
+/// Resolves `job.tags` (already trimmed, deduplicated, and merged with the top-level default
+/// — see `config::merge_tags`) into their import-side ids, creating whatever doesn't already
+/// exist: `PUT /tags` is create-or-get by value, so this is a single request regardless of
+/// how many of the names are new versus already present. A job that configures no tags
+/// short-circuits to an empty `Vec` without making any call at all — the common case, and
+/// also what lets a job with no `tag.*` permission on its API key run untouched.
+///
+/// A name the response doesn't resolve is **not** fatal to startup: only `warn!`ed and left
+/// out of the returned ids (never retried until the job's next remote-checks attempt, same
+/// as everything else `run_startup` does). The spec documents `PUT /tags`'s request/response
+/// shape but not its exact behaviour for a name that already exists — if it turns out to
+/// only echo back newly *created* tags rather than every one requested, a hard failure here
+/// would permanently break every job with a pre-existing tag, on every restart. A job that
+/// syncs but silently skips one bad/unresolved tag name is strictly better than a job that
+/// never runs at all.
+async fn resolve_tags(import: &ImportClient, tags: &[String]) -> anyhow::Result<Vec<Uuid>> {
+    if tags.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let resolved = import
+        .upsert_tags(tags)
+        .await
+        .context("failed to create/resolve the configured tags (PUT /tags)")?;
+    let by_value: HashMap<&str, Uuid> = resolved
+        .iter()
+        .map(|tag| (tag.value.as_str(), tag.id))
+        .collect();
+
+    let mut ids = Vec::with_capacity(tags.len());
+    for name in tags {
+        match by_value.get(name.as_str()) {
+            Some(id) => ids.push(*id),
+            None => warn!(
+                "the import instance's response to PUT /tags did not include a resolved tag \
+                 for {name:?}, even though it was in the request; this tag will not be applied \
+                 this run"
+            ),
+        }
+    }
+    Ok(ids)
 }
 
 // ---------------------------------------------------------------------------------------
@@ -220,6 +286,9 @@ pub struct StartupSummary {
     pub target_album_id: Uuid,
     pub interval: std::time::Duration,
     pub concurrency: u32,
+    /// The job's fully resolved tags (top-level default merged with the job's own, per
+    /// `config::merge_tags`) — empty when the job doesn't tag anything.
+    pub tags: Vec<String>,
 }
 
 /// Renders the process-wide `cache=…` startup line: `cache=disabled` when `CACHE_DIR` is
@@ -248,7 +317,7 @@ impl StartupSummary {
             "startup complete export_version={} import_version={} share_link_id={} \
              share_link_type={} share_link_expires_at={expires_at} export_album={:?} \
              export_asset_count={} import_album={:?} import_album_id={} interval={} \
-             concurrency={}",
+             concurrency={} tags={:?}",
             self.export_version,
             self.import_version,
             self.share_link_id,
@@ -258,7 +327,8 @@ impl StartupSummary {
             self.target_album_name,
             self.target_album_id,
             humantime::format_duration(self.interval),
-            self.concurrency
+            self.concurrency,
+            self.tags
         );
     }
 }
@@ -365,17 +435,24 @@ pub async fn run_startup(
     info!("import server version {import_version}");
     check_import_version(import_version)?;
 
-    // Step 8 — I2: API key permission check.
+    // Step 8 — I2: API key permission check. `tag.create`/`tag.asset` are only demanded of a
+    // job that actually configures at least one tag — see `required_permissions_for`.
     let api_key = import
         .get_api_key()
         .await
         .context("failed to fetch the import API key's own permissions (GET /api-keys/me)")?;
-    check_api_key_permissions(&api_key)?;
+    check_api_key_permissions(&api_key, &required_permissions_for(job))?;
 
     // Step 9 — I3: resolve import_album. `ImportError`'s own messages (album-not-found by
     // id, by name with the available albums listed, or ambiguous-name with the matching
     // ids) are already exactly the actionable text §5 step 9 asks for — nothing to add.
     let target_album = import.resolve_album(&job.import_album_ref()).await?;
+
+    // Step 9b — resolve (and create, if needed) the job's configured tags. A no-op (no
+    // call, empty result) for a job with no tags. Not part of `PLAN.md`'s original numbered
+    // steps, but slots in naturally right after album resolution — both are "resolve
+    // something on the import side that every sync run will need the id of".
+    let tag_ids = resolve_tags(&import, &job.tags).await?;
 
     // Step 10 — summary.
     let summary = StartupSummary {
@@ -390,6 +467,7 @@ pub async fn run_startup(
         target_album_id: target_album.id,
         interval: job.interval,
         concurrency: transfer_concurrency,
+        tags: job.tags.clone(),
     };
     summary.log();
 
@@ -405,6 +483,7 @@ pub async fn run_startup(
         cache,
         transfers,
         tmp_dir,
+        tag_ids,
     );
 
     Ok(StartupOutcome { sync, summary })
@@ -430,6 +509,7 @@ mod tests {
             interval: std::time::Duration::from_secs(3600),
             request_timeout: std::time::Duration::from_secs(30),
             transfer_timeout: std::time::Duration::from_secs(30 * 60),
+            tags: Vec::new(),
         }
     }
 
@@ -579,13 +659,13 @@ mod tests {
                 .map(ToString::to_string)
                 .collect(),
         );
-        assert!(check_api_key_permissions(&key).is_ok());
+        assert!(check_api_key_permissions(&key, &dto::REQUIRED_PERMISSIONS).is_ok());
     }
 
     #[test]
     fn permission_check_passes_with_the_all_wildcard() {
         let key = api_key(vec![dto::PERMISSION_ALL.to_owned()]);
-        assert!(check_api_key_permissions(&key).is_ok());
+        assert!(check_api_key_permissions(&key, &dto::REQUIRED_PERMISSIONS).is_ok());
     }
 
     /// Which permissions come back as missing is `ApiKeyResponseDto::missing_permissions`'s
@@ -594,10 +674,37 @@ mod tests {
     #[test]
     fn permission_check_fails_when_a_permission_is_missing() {
         let key = api_key(vec![dto::PERMISSION_ASSET_UPLOAD.to_owned()]);
-        assert!(check_api_key_permissions(&key).is_err());
+        assert!(check_api_key_permissions(&key, &dto::REQUIRED_PERMISSIONS).is_err());
+    }
+
+    #[test]
+    fn required_permissions_for_a_job_with_no_tags_excludes_tag_permissions() {
+        let job = test_job(
+            "https://export.example.com",
+            "https://import.example.com",
+            "album",
+        );
+        let required = required_permissions_for(&job);
+        assert!(!required.contains(&dto::PERMISSION_TAG_CREATE));
+        assert!(!required.contains(&dto::PERMISSION_TAG_ASSET));
+    }
+
+    #[test]
+    fn required_permissions_for_a_job_with_tags_includes_tag_permissions() {
+        let mut job = test_job(
+            "https://export.example.com",
+            "https://import.example.com",
+            "album",
+        );
+        job.tags = vec!["Family".to_owned()];
+        let required = required_permissions_for(&job);
+        assert!(required.contains(&dto::PERMISSION_TAG_CREATE));
+        assert!(required.contains(&dto::PERMISSION_TAG_ASSET));
     }
 
     // ---- run_startup end-to-end (real in-process HTTP, not a mock) --------------------------
+
+    use std::sync::atomic::{AtomicU32, Ordering};
 
     use axum::Json;
     use axum::Router;
@@ -661,6 +768,172 @@ mod tests {
                     Json(json!({"id": id, "albumName": "My Family Photos", "assetCount": 0}))
                 }),
             )
+    }
+
+    /// [`import_app`] plus a `PUT /tags` route (create-or-get by value, echoing back every
+    /// requested name except `unresolved_name` — if given — with a fabricated id) and
+    /// `tag.create`/`tag.asset` added to the permission set — used only by the
+    /// tags-specific `run_startup` tests below. Hands back a call counter so a test can
+    /// assert `PUT /tags` was hit exactly once.
+    fn import_app_with_tags(unresolved_name: Option<&'static str>) -> (Router, Arc<AtomicU32>) {
+        let calls = Arc::new(AtomicU32::new(0));
+        let calls_for_handler = calls.clone();
+        let app = Router::new()
+            .route(
+                "/server/version",
+                get(|| async {
+                    Json(json!({"major": 3, "minor": 1, "patch": 0, "prerelease": null}))
+                }),
+            )
+            .route(
+                "/api-keys/me",
+                get(|| async {
+                    let mut permissions: Vec<&str> = dto::REQUIRED_PERMISSIONS.to_vec();
+                    permissions.extend(dto::TAG_PERMISSIONS);
+                    Json(json!({
+                        "id": "3fa85f64-5717-4562-b3fc-2c963f66afa6",
+                        "name": "sync-key",
+                        "permissions": permissions,
+                        "createdAt": "2024-01-01T00:00:00.000Z",
+                        "updatedAt": "2024-01-01T00:00:00.000Z"
+                    }))
+                }),
+            )
+            .route(
+                "/albums/{id}",
+                get(|Path(id): Path<String>| async move {
+                    Json(json!({"id": id, "albumName": "My Family Photos", "assetCount": 0}))
+                }),
+            )
+            .route(
+                "/tags",
+                axum::routing::put(move |Json(body): Json<serde_json::Value>| {
+                    let calls = calls_for_handler.clone();
+                    async move {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let names = body["tags"].as_array().cloned().unwrap_or_default();
+                        let results: Vec<_> = names
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, name)| name.as_str() != unresolved_name)
+                            .map(|(i, name)| {
+                                json!({
+                                    "id": Uuid::from_u128(i as u128 + 1).to_string(),
+                                    "name": name,
+                                    "value": name,
+                                    "createdAt": "2024-01-01T00:00:00.000Z",
+                                    "updatedAt": "2024-01-01T00:00:00.000Z"
+                                })
+                            })
+                            .collect();
+                        Json(results)
+                    }
+                }),
+            );
+        (app, calls)
+    }
+
+    #[tokio::test]
+    async fn run_startup_resolves_and_creates_configured_tags() {
+        let (export_base, _export_server) =
+            spawn_test_server(Router::new().nest("/api", export_app())).await;
+        let (import_app, tag_calls) = import_app_with_tags(None);
+        let (import_base, _import_server) =
+            spawn_test_server(Router::new().nest("/api", import_app)).await;
+
+        let target_album_id = "8a5e1e2b-2222-4444-8888-aaaaaaaaaaaa";
+        let mut job = test_job(
+            &format!("{export_base}share/testkey"),
+            import_base.as_str(),
+            target_album_id,
+        );
+        job.tags = vec!["Family".to_owned(), "Holiday".to_owned()];
+
+        let outcome = run_startup(
+            &job,
+            Arc::new(ContentHashCache::disabled()),
+            Arc::new(Semaphore::new(4)),
+            4,
+            None,
+        )
+        .await
+        .expect("startup should succeed");
+
+        assert_eq!(
+            outcome.summary.tags,
+            vec!["Family".to_owned(), "Holiday".to_owned()]
+        );
+        assert_eq!(
+            tag_calls.load(Ordering::SeqCst),
+            1,
+            "PUT /tags must be called exactly once at startup"
+        );
+    }
+
+    /// Regression test: `PUT /tags` not echoing back one of the requested names (e.g. because
+    /// it only returns newly *created* tags, not ones that already existed — the spec doesn't
+    /// pin this down either way) must not brick the job forever. See `resolve_tags`'s doc
+    /// comment for why this is a `warn!` and a skipped tag, not a fatal startup error.
+    #[tokio::test]
+    async fn run_startup_still_succeeds_when_a_tag_is_not_resolved() {
+        let (export_base, _export_server) =
+            spawn_test_server(Router::new().nest("/api", export_app())).await;
+        let (import_app, _tag_calls) = import_app_with_tags(Some("Holiday"));
+        let (import_base, _import_server) =
+            spawn_test_server(Router::new().nest("/api", import_app)).await;
+
+        let mut job = test_job(
+            &format!("{export_base}share/testkey"),
+            import_base.as_str(),
+            "8a5e1e2b-2222-4444-8888-aaaaaaaaaaaa",
+        );
+        job.tags = vec!["Family".to_owned(), "Holiday".to_owned()];
+
+        let outcome = run_startup(
+            &job,
+            Arc::new(ContentHashCache::disabled()),
+            Arc::new(Semaphore::new(4)),
+            4,
+            None,
+        )
+        .await
+        .expect("an unresolved tag must not fail startup");
+
+        // `job.tags` (what was configured) is unaffected — it's `resolve_tags`'s returned
+        // ids, threaded into the `SyncContext` this test can't see from here, that quietly
+        // drop "Holiday". `run_once`-level coverage of that lives in `sync.rs`.
+        assert_eq!(
+            outcome.summary.tags,
+            vec!["Family".to_owned(), "Holiday".to_owned()]
+        );
+    }
+
+    #[tokio::test]
+    async fn run_startup_fails_when_tags_are_configured_without_tag_permissions() {
+        let (export_base, _export_server) =
+            spawn_test_server(Router::new().nest("/api", export_app())).await;
+        let (import_base, _import_server) =
+            spawn_test_server(Router::new().nest("/api", import_app())).await;
+
+        let mut job = test_job(
+            &format!("{export_base}share/testkey"),
+            import_base.as_str(),
+            "8a5e1e2b-2222-4444-8888-aaaaaaaaaaaa",
+        );
+        job.tags = vec!["Family".to_owned()];
+
+        assert!(
+            run_startup(
+                &job,
+                Arc::new(ContentHashCache::disabled()),
+                Arc::new(Semaphore::new(4)),
+                4,
+                None,
+            )
+            .await
+            .is_err(),
+            "the key only has the base REQUIRED_PERMISSIONS, not tag.create/tag.asset"
+        );
     }
 
     #[tokio::test]

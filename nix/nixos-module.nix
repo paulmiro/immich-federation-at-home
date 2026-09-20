@@ -55,6 +55,15 @@ in
         transfer_timeout = lib.mkOption (
           optionalStr "Timeout for transferring a single asset. Default: `30m`."
         );
+        tags = lib.mkOption {
+          type = lib.types.nullOr (lib.types.listOf lib.types.str);
+          default = null;
+          description = ''
+            Tags to attach to every synced asset, created on the import instance if they
+            don't already exist. Unlike every other option here, a job's own list is
+            *merged with* (never overridden by) the one set next to {option}`jobs`, deduplicated.
+          '';
+        };
       }
       // secretOptions "export_album_password"
       // secretOptions "import_api_key";

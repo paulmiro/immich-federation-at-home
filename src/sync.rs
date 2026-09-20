@@ -62,6 +62,13 @@ pub struct RunSummary {
     /// out to be a duplicate on the import side is counted in both this and
     /// `already_present`.
     pub cache_hits: usize,
+    /// Assets the import instance reported as tagged this run (step 4b) — every asset that
+    /// needed a step-4 album-add, freshly uploaded or already present alike, when the job
+    /// configures at least one tag. Zero (not tracked separately from a real zero) both when
+    /// the job configures no tags and when the tag-assets call itself failed — see
+    /// [`SyncContext::tag_assets`]'s doc comment for why that failure is isolated rather than
+    /// propagated.
+    pub tagged: u64,
     /// Wall-clock time for the whole run.
     pub took: Duration,
 }
@@ -120,10 +127,14 @@ pub struct SyncContext {
     /// ([`Self::transfer_one_inner`]), with nothing to share across jobs the way `cache` and
     /// `transfers` above are shared.
     tmp_dir: Option<PathBuf>,
+    /// The job's configured tags, already resolved to import-side ids by
+    /// `startup::resolve_tags` (creating whatever didn't already exist). Empty means "don't
+    /// tag anything" — [`Self::tag_assets`] short-circuits without a call in that case.
+    tag_ids: Vec<Uuid>,
 }
 
 impl SyncContext {
-    /// 11 constructor arguments rather than a builder or params struct: every field is a
+    /// 12 constructor arguments rather than a builder or params struct: every field is a
     /// distinct, already-well-named piece of startup state (see each field's own doc comment
     /// above) built exactly once per job (`startup.rs::run_startup`) and once more in this
     /// module's own tests — there is no repeated or optional-subset call site that a builder
@@ -141,6 +152,7 @@ impl SyncContext {
         cache: Arc<ContentHashCache>,
         transfers: Arc<Semaphore>,
         tmp_dir: Option<PathBuf>,
+        tag_ids: Vec<Uuid>,
     ) -> Self {
         Self {
             export,
@@ -154,6 +166,7 @@ impl SyncContext {
             cache,
             transfers,
             tmp_dir,
+            tag_ids,
         }
     }
 
@@ -236,6 +249,15 @@ impl SyncContext {
         let (added_to_album_count, album_failed_count) = self.add_to_album(&album_targets).await?;
         let failed_count = counts.failed + album_failed_count;
 
+        // ---- 4b. tags -------------------------------------------------------------------
+        // Every asset that needed a step-4 album-add this run (freshly uploaded or an
+        // already-present duplicate alike) gets tagged too — the same idempotent
+        // "re-assert every run" treatment as album membership, and the same target set.
+        // Unlike step 4, a failure here is isolated rather than propagated: uploading and
+        // albuming already succeeded, tagging is naturally retried next tick against the
+        // same recomputed asset set, and there is nothing per-asset to roll back.
+        let tagged_count = self.tag_assets(&album_targets).await;
+
         // ---- persist the content-hash cache --------------------------------------------
         // TTL-based pruning (`scratch/JOBS-DESIGN.md`) means this no longer needs to
         // coincide with anything about this run in particular: unlike the old keep-set
@@ -261,11 +283,12 @@ impl SyncContext {
             added_to_album: added_to_album_count,
             skipped: counts.skipped,
             cache_hits,
+            tagged: tagged_count,
             took,
         };
         info!(
             "sync run complete source={} already_present={} transferred={} failed={} \
-             added_to_album={} skipped={} cache_hits={} took={:.1?}",
+             added_to_album={} skipped={} cache_hits={} tagged={} took={:.1?}",
             summary.source,
             summary.already_present,
             summary.transferred,
@@ -273,6 +296,7 @@ impl SyncContext {
             summary.added_to_album,
             summary.skipped,
             summary.cache_hits,
+            summary.tagged,
             summary.took
         );
         Ok(summary)
@@ -487,6 +511,39 @@ impl SyncContext {
         );
 
         Ok((outcome.added.len(), failed_count))
+    }
+
+    /// Step 4b: `PUT /tags/assets` with every id in `album_targets` and every tag id this
+    /// job resolved at startup — idempotent on the server, same as step 4's album-add.
+    /// Skips the call entirely when there's nothing to tag (no assets this run, or the job
+    /// configures no tags at all), returning `0`. Deliberately **not** propagated as an
+    /// `Err` on failure either (also `0` in that case): see the call site's comment for why
+    /// a tagging failure is isolated rather than fatal to the run.
+    async fn tag_assets(&self, album_targets: &HashMap<Uuid, String>) -> u64 {
+        if self.tag_ids.is_empty() || album_targets.is_empty() {
+            return 0;
+        }
+
+        let ids: Vec<Uuid> = album_targets.keys().copied().collect();
+        match self.import.tag_assets(&self.tag_ids, &ids).await {
+            Ok(count) => {
+                debug!(
+                    "tag-assets complete tag_ids={:?} assets={} count={count}",
+                    self.tag_ids,
+                    ids.len()
+                );
+                count
+            }
+            Err(err) => {
+                error!(
+                    "failed to tag assets on the import instance tag_ids={:?} assets={}: {}",
+                    self.tag_ids,
+                    ids.len(),
+                    format_error_chain_dyn(&err)
+                );
+                0
+            }
+        }
     }
 
     /// One asset's whole step-3 span, bounded by `TRANSFER_TIMEOUT`.
@@ -1068,6 +1125,11 @@ mod tests {
         unsupported: HashSet<String>,
         /// album id -> member asset ids, simulating I6's idempotent membership.
         album_members: HashMap<Uuid, HashSet<Uuid>>,
+        /// tag id -> tagged asset ids, simulating `PUT /tags/assets`'s idempotent tagging.
+        tag_assignments: HashMap<Uuid, HashSet<Uuid>>,
+        /// When set, `PUT /tags/assets` always fails — simulating a tagging outage isolated
+        /// from an otherwise-healthy run (`tag_assets_failure_does_not_fail_the_run`).
+        fail_tag_assets: bool,
         next_id: u128,
         upload_calls: u32,
     }
@@ -1085,6 +1147,7 @@ mod tests {
             .route("/assets/bulk-upload-check", post(bulk_upload_check_handler))
             .route("/assets", post(upload_handler))
             .route("/albums/{id}/assets", put(album_add_handler))
+            .route("/tags/assets", put(tag_assets_handler))
             .with_state(state.clone());
         let (base, handle) = spawn_test_server(Router::new().nest("/api", app)).await;
         (base, state, handle)
@@ -1167,6 +1230,35 @@ mod tests {
         Json(json!(results))
     }
 
+    async fn tag_assets_handler(
+        State(state): State<Arc<Mutex<ImportServerState>>>,
+        Json(body): Json<serde_json::Value>,
+    ) -> (StatusCode, Json<serde_json::Value>) {
+        let mut state = state.lock().unwrap();
+        if state.fail_tag_assets {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"statusCode": 500, "message": "boom"})),
+            );
+        }
+        let parse_ids = |key: &str| -> Vec<Uuid> {
+            body[key]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(|v| v.as_str().unwrap().parse().unwrap())
+                .collect()
+        };
+        let tag_ids = parse_ids("tagIds");
+        let asset_ids = parse_ids("assetIds");
+        for tag_id in &tag_ids {
+            let tagged = state.tag_assignments.entry(*tag_id).or_default();
+            tagged.extend(asset_ids.iter().copied());
+        }
+        (StatusCode::OK, Json(json!({"count": asset_ids.len()})))
+    }
+
     fn secret(value: &str) -> Secret {
         value.parse().unwrap()
     }
@@ -1212,6 +1304,33 @@ mod tests {
         import_album_id: Uuid,
         cache: ContentHashCache,
     ) -> SyncContext {
+        context_with_cache_and_tags(export_base, import_base, import_album_id, cache, Vec::new())
+    }
+
+    /// Like [`context`], but with `tag_ids` already resolved — as `startup::resolve_tags`
+    /// would have left them — for the tagging-specific tests below.
+    fn context_with_tags(
+        export_base: &Url,
+        import_base: &Url,
+        import_album_id: Uuid,
+        tag_ids: Vec<Uuid>,
+    ) -> SyncContext {
+        context_with_cache_and_tags(
+            export_base,
+            import_base,
+            import_album_id,
+            ContentHashCache::disabled(),
+            tag_ids,
+        )
+    }
+
+    fn context_with_cache_and_tags(
+        export_base: &Url,
+        import_base: &Url,
+        import_album_id: Uuid,
+        cache: ContentHashCache,
+        tag_ids: Vec<Uuid>,
+    ) -> SyncContext {
         SyncContext::new(
             export_client(export_base),
             import_client(import_base),
@@ -1224,6 +1343,7 @@ mod tests {
             Arc::new(cache),
             Arc::new(Semaphore::new(4)),
             None,
+            tag_ids,
         )
     }
 
@@ -1726,5 +1846,95 @@ mod tests {
                 .is_some_and(|members| members.contains(&existing_id)),
             "the existing import-side asset must be added to the album, not silently dropped"
         );
+    }
+
+    // ---- tags -----------------------------------------------------------------------------
+
+    const TAG_ID: Uuid = Uuid::from_u128(0x7A6_0000_0000_0000_0000_0000_0000_0000);
+
+    #[tokio::test]
+    async fn no_tags_configured_means_no_tag_assets_call() {
+        let fixtures = vec![fixture(1, "a.jpg", b"asset one bytes")];
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let ctx = context(&export_base, &import_base, ALBUM_ID);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.tagged, 0);
+        assert!(
+            state.lock().unwrap().tag_assignments.is_empty(),
+            "a job with no configured tags must never call PUT /tags/assets"
+        );
+    }
+
+    #[tokio::test]
+    async fn freshly_transferred_assets_are_tagged() {
+        let fixtures = vec![fixture(1, "a.jpg", b"asset one bytes")];
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let ctx = context_with_tags(&export_base, &import_base, ALBUM_ID, vec![TAG_ID]);
+
+        let summary = ctx.run_once().await.unwrap();
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(summary.tagged, 1);
+
+        let state = state.lock().unwrap();
+        assert_eq!(
+            state.tag_assignments.get(&TAG_ID).map(HashSet::len),
+            Some(1)
+        );
+    }
+
+    #[tokio::test]
+    async fn already_present_assets_are_tagged_too() {
+        let fixtures = vec![fixture(1, "already.jpg", b"already on the import side")];
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures.clone()).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let existing_id = Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0001);
+        {
+            let mut state = state.lock().unwrap();
+            state
+                .by_checksum
+                .insert(fixtures[0].checksum.clone(), existing_id);
+        }
+        let ctx = context_with_tags(&export_base, &import_base, ALBUM_ID, vec![TAG_ID]);
+
+        let summary = ctx.run_once().await.unwrap();
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.tagged, 1);
+
+        let state = state.lock().unwrap();
+        assert!(
+            state
+                .tag_assignments
+                .get(&TAG_ID)
+                .is_some_and(|tagged| tagged.contains(&existing_id)),
+            "an asset the import instance already had must still be tagged, matching how it's \
+             still added to the album"
+        );
+    }
+
+    #[tokio::test]
+    async fn tag_assets_failure_does_not_fail_the_run() {
+        let fixtures = vec![fixture(1, "a.jpg", b"asset one bytes")];
+        let (export_base, _downloads, _e) = spawn_export_server(fixtures).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        state.lock().unwrap().fail_tag_assets = true;
+        let ctx = context_with_tags(&export_base, &import_base, ALBUM_ID, vec![TAG_ID]);
+
+        let summary = ctx
+            .run_once()
+            .await
+            .expect("a tag-assets failure must not fail the run");
+
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(
+            summary.added_to_album, 1,
+            "the album-add step must still succeed independently of tagging"
+        );
+        assert_eq!(summary.tagged, 0);
+        assert!(state.lock().unwrap().tag_assignments.is_empty());
     }
 }
