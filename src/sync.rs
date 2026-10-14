@@ -60,7 +60,8 @@ pub struct RunSummary {
     /// like a content-hashed asset. Tracked separately from `already_present`/`transferred`
     /// so an operator can tell the cache is actually doing something; a cache hit that turned
     /// out to be a duplicate on the import side is counted in both this and
-    /// `already_present`.
+    /// `already_present`. Also counts edited assets checked against the render of them the
+    /// cache remembers importing earlier (see [`SyncContext::partition_cohorts`]).
     pub cache_hits: usize,
     /// Assets the import instance reported as tagged this run (step 4b) — every asset that
     /// needed a step-4 album-add, freshly uploaded or already present alike, when the job
@@ -350,6 +351,33 @@ impl SyncContext {
         let mut cache_hits: usize = 0;
 
         for asset in source_assets {
+            // An edited asset (see `SourceAsset::is_edited`) is checked up front against
+            // whichever render of it was imported first, if the cache remembers one — so a
+            // re-edit on the export side never brings in a second copy. Otherwise it's checked
+            // against its listed checksum, the unedited original's: if the import instance
+            // already has that (mirrored before the asset was edited), it counts as present
+            // and the edit is never imported either. Only if neither is there is it
+            // downloaded, and then (with no expected checksum, see `classify`) checked again
+            // on the bytes actually received, exactly like a path-hashed cache miss.
+            if asset.is_edited {
+                let checksum = if let Some(imported_render) = self
+                    .cache
+                    .get_sticky(&self.export_instance, &asset.checksum)
+                {
+                    debug!(
+                        "edited asset, checking against the render imported earlier \
+                         {asset} imported_checksum={imported_render}"
+                    );
+                    cache_hits += 1;
+                    imported_render
+                } else {
+                    debug!("edited asset, checking against its unedited original {asset}");
+                    asset.checksum.clone()
+                };
+                check_candidates.push(CheckCandidate { asset, checksum });
+                continue;
+            }
+
             if !asset.checksum_is_path_hash() {
                 let checksum = asset.checksum.clone();
                 check_candidates.push(CheckCandidate { asset, checksum });
@@ -405,10 +433,16 @@ impl SyncContext {
         for candidate in candidates {
             let CheckCandidate { asset, checksum } = candidate;
             match outcomes.get(asset.id.to_string().as_str()) {
-                Some(BulkUploadCheckOutcome::Accept) => to_transfer.push(PlannedTransfer {
-                    asset,
-                    expected_checksum: Some(checksum),
-                }),
+                // An edited asset's download is the *current* render, which need not hash to
+                // either checksum it was checked against, so it gets no expected checksum and
+                // goes through the post-download check instead (see `partition_cohorts`).
+                Some(BulkUploadCheckOutcome::Accept) => {
+                    let expected_checksum = (!asset.is_edited).then_some(checksum);
+                    to_transfer.push(PlannedTransfer {
+                        asset,
+                        expected_checksum,
+                    });
+                }
                 Some(BulkUploadCheckOutcome::Reject {
                     reason: Some(dto::AssetRejectReason::Duplicate),
                     asset_id: Some(import_id),
@@ -666,7 +700,18 @@ impl SyncContext {
         // reaches here (its cached hash didn't dedupe it against the import instance) just
         // reconfirms what the cache already had; a miss is what actually populates the
         // cache. A no-op when the cache is disabled.
-        if asset.checksum_is_path_hash() {
+        //
+        // An edited asset only reaches here when no render of it is on the import instance
+        // yet (`partition_cohorts`), so the render just downloaded becomes the one every later
+        // run deduplicates against, overwriting whatever the cache remembered before.
+        if asset.is_edited {
+            self.cache.insert_sticky(
+                &self.export_instance,
+                asset.checksum.clone(),
+                asset.modified,
+                download_outcome.checksum_sha1_base64.clone(),
+            );
+        } else if asset.checksum_is_path_hash() {
             self.cache.insert(
                 &self.export_instance,
                 asset.checksum.clone(),
@@ -853,7 +898,8 @@ impl SyncContext {
 /// One item [`SyncContext::classify`] sent to `bulk-upload-check`: an asset paired with the
 /// content checksum actually used for that check. Equal to `asset.checksum` for a
 /// content-hashed asset; the cached content hash (not `asset.checksum`, the path hash) for a
-/// path-hashed cache hit — see `scratch/CACHE-DESIGN.md`.
+/// path-hashed cache hit — see `scratch/CACHE-DESIGN.md`; for an edited asset, the render
+/// imported earlier or else the unedited original (see [`SyncContext::partition_cohorts`]).
 struct CheckCandidate {
     asset: SourceAsset,
     checksum: String,
@@ -883,22 +929,22 @@ struct TransferCounts {
 
 /// One asset step 3 is about to transfer, carrying the checksum step 3b should verify the
 /// downloaded bytes against — `Some` for a content-hashed asset or a path-hashed cache hit,
-/// `None` for a path-hashed cache miss, whose real content hash isn't known until the bytes
-/// have arrived (`scratch/CACHE-DESIGN.md`).
+/// `None` for a path-hashed cache miss or an edited asset, whose real content hash isn't
+/// known until the bytes have arrived (`scratch/CACHE-DESIGN.md`, `SourceAsset::is_edited`).
 struct PlannedTransfer {
     asset: SourceAsset,
     expected_checksum: Option<String>,
 }
 
-/// What [`SyncContext::transfer_one`] hands back to [`SyncContext::run_once`]. A cache miss
-/// can resolve to any of the four variants (its own post-download check can find it already
-/// present or permanently unsupported), where a content-hashed asset or a cache hit can only
-/// ever end up `Transferred` or `Failed`.
+/// What [`SyncContext::transfer_one`] hands back to [`SyncContext::run_once`]. A path-hashed
+/// cache miss or an edited asset can resolve to any of the four variants (its own post-download check
+/// can find it already present or permanently unsupported), where a content-hashed asset or
+/// a path-hashed cache hit can only ever end up `Transferred` or `Failed`.
 enum TransferOutcome {
     /// Freshly uploaded. `import_id`/`filename` are what step 4 needs to add it to the album.
     Transferred { import_id: Uuid, filename: String },
-    /// The post-download check (path-hashed cache miss only) found the import instance
-    /// already had these bytes — not uploaded, but still added to the album.
+    /// The post-download check (path-hashed cache miss or edited asset) found the import
+    /// instance already had these bytes — not uploaded, but still added to the album.
     AlreadyPresent { import_id: Uuid, filename: String },
     /// The post-download check rejected it permanently (unsupported format), or returned
     /// something unclassifiable. Never retried by a later tick unless the source changes.
@@ -990,6 +1036,9 @@ mod tests {
         /// If set, `GET /assets/{id}/original` always 500s — simulating a download
         /// failure isolated to this one asset.
         fail: bool,
+        /// `isEdited`. Set only by [`edited_fixture`], whose `bytes` (the render a shared link
+        /// serves) deliberately do not hash to `checksum` (the unedited original's).
+        is_edited: bool,
     }
 
     /// `fileModifiedAt`/`fileCreatedAt` every fixture uses unless a test overrides it via
@@ -1008,6 +1057,7 @@ mod tests {
             modified: DEFAULT_MODIFIED.to_owned(),
             corrupt: false,
             fail: false,
+            is_edited: false,
         }
     }
 
@@ -1027,6 +1077,17 @@ mod tests {
             modified: DEFAULT_MODIFIED.to_owned(),
             corrupt: false,
             fail: false,
+            is_edited: false,
+        }
+    }
+
+    /// An asset edited on the export side: listed with the unedited `original`'s checksum,
+    /// but downloading as `render` — what a real shared link does (`SourceAsset::is_edited`).
+    fn edited_fixture(n: u128, filename: &str, original: &[u8], render: &[u8]) -> ExportFixture {
+        ExportFixture {
+            bytes: render.to_vec(),
+            is_edited: true,
+            ..fixture(n, filename, original)
         }
     }
 
@@ -1056,6 +1117,7 @@ mod tests {
             "originalMimeType": "image/jpeg",
             "duration": null,
             "originalPath": f.original_path,
+            "isEdited": f.is_edited,
         })
     }
 
@@ -1845,6 +1907,127 @@ mod tests {
                 .get(&ALBUM_ID)
                 .is_some_and(|members| members.contains(&existing_id)),
             "the existing import-side asset must be added to the album, not silently dropped"
+        );
+    }
+
+    // ---- edited assets (`SourceAsset::is_edited`) ------------------------------------------
+
+    /// The bug this exists for: an edited asset's download is the render, which never hashes
+    /// to the listed (original) checksum. It must be transferred, not failed as corrupt, and
+    /// the render's hash remembered for later runs.
+    #[tokio::test]
+    async fn edited_asset_is_transferred_as_its_render() {
+        let fx = edited_fixture(1, "cropped.jpg", b"the original", b"the first crop");
+        let (export_base, _downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(cache_dir.path()).unwrap();
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(summary.added_to_album, 1);
+        assert!(
+            state
+                .lock()
+                .unwrap()
+                .by_checksum
+                .contains_key(&content_checksum(b"the first crop"))
+        );
+        let reopened = ContentHashCache::open(cache_dir.path()).unwrap();
+        assert_eq!(
+            reopened.get_sticky(TEST_EXPORT_INSTANCE, &fx.checksum),
+            Some(content_checksum(b"the first crop"))
+        );
+    }
+
+    /// The owner edits again after we imported the first crop: the new crop must not be
+    /// imported as a second copy, and must not even be downloaded.
+    #[tokio::test]
+    async fn re_editing_after_import_does_not_import_a_second_copy() {
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache_dir = tempfile::tempdir().unwrap();
+
+        let first_edit = edited_fixture(1, "cropped.jpg", b"the original", b"the first crop");
+        let (export_base, _downloads, _e) = spawn_export_server(vec![first_edit]).await;
+        let ctx = context_with_cache(
+            &export_base,
+            &import_base,
+            ALBUM_ID,
+            ContentHashCache::open(cache_dir.path()).unwrap(),
+        );
+        assert_eq!(ctx.run_once().await.unwrap().transferred, 1);
+
+        let second_edit = edited_fixture(1, "cropped.jpg", b"the original", b"the second crop");
+        let (export_base, downloads, _e2) = spawn_export_server(vec![second_edit]).await;
+        let ctx = context_with_cache(
+            &export_base,
+            &import_base,
+            ALBUM_ID,
+            ContentHashCache::open(cache_dir.path()).unwrap(),
+        );
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(summary.cache_hits, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(downloads.load(Ordering::Relaxed), 0);
+        assert_eq!(state.lock().unwrap().upload_calls, 1);
+    }
+
+    /// Mirrored before it was edited: the import instance already has the unedited original,
+    /// so the edit is never imported next to it.
+    #[tokio::test]
+    async fn edited_asset_whose_original_was_already_imported_is_not_imported_again() {
+        let fx = edited_fixture(1, "cropped.jpg", b"the original", b"the first crop");
+        let (export_base, downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let existing_id = Uuid::from_u128(0xB000_0000_0000_0000_0000_0000_0000_0001);
+        state
+            .lock()
+            .unwrap()
+            .by_checksum
+            .insert(fx.checksum.clone(), existing_id);
+        let ctx = context(&export_base, &import_base, ALBUM_ID);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.transferred, 0);
+        assert_eq!(summary.already_present, 1);
+        assert_eq!(summary.added_to_album, 1);
+        assert_eq!(downloads.load(Ordering::Relaxed), 0);
+        let state = state.lock().unwrap();
+        assert_eq!(state.upload_calls, 0);
+        assert!(state.album_members[&ALBUM_ID].contains(&existing_id));
+    }
+
+    /// The render the cache remembers is gone from the import instance (permanently deleted
+    /// there): the current render is imported in its place and becomes the remembered one.
+    #[tokio::test]
+    async fn a_remembered_render_missing_on_the_import_side_is_replaced_by_the_current_one() {
+        let fx = edited_fixture(1, "cropped.jpg", b"the original", b"the second crop");
+        let (export_base, _downloads, _e) = spawn_export_server(vec![fx.clone()]).await;
+        let (import_base, state, _i) = spawn_import_server().await;
+        let cache = ContentHashCache::disabled();
+        cache.insert_sticky(
+            TEST_EXPORT_INSTANCE,
+            fx.checksum.clone(),
+            default_modified(),
+            content_checksum(b"the first crop"),
+        );
+        let ctx = context_with_cache(&export_base, &import_base, ALBUM_ID, cache);
+
+        let summary = ctx.run_once().await.unwrap();
+
+        assert_eq!(summary.transferred, 1);
+        assert_eq!(summary.failed, 0);
+        assert_eq!(state.lock().unwrap().upload_calls, 1);
+        assert_eq!(
+            ctx.cache.get_sticky(TEST_EXPORT_INSTANCE, &fx.checksum),
+            Some(content_checksum(b"the second crop"))
         );
     }
 

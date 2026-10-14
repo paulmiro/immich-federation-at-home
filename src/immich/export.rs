@@ -65,6 +65,14 @@ pub struct SourceAsset {
     /// because it really is empty — either way [`Self::checksum_is_path_hash`] treats
     /// `None` as "assume content-hashed", the safe fallback.
     pub original_path: Option<String>,
+    /// Whether the asset was edited (cropped, rotated, …) in the export instance's web UI.
+    /// A shared link can only ever download the *edited* render of such an asset — the
+    /// server forces `edited=true` for shared-link auth (`asset-media.service.ts`,
+    /// `downloadOriginal`), so the unedited original is unreachable — while `checksum` stays
+    /// the SHA-1 of the unedited original. So, like a path hash, `checksum` here does not
+    /// describe the bytes a download will produce; see `sync.rs` for how such assets are
+    /// deduplicated instead.
+    pub is_edited: bool,
 }
 
 impl fmt::Display for SourceAsset {
@@ -113,6 +121,7 @@ impl TryFrom<dto::AssetResponseDto> for SourceAsset {
             r#type: asset.r#type,
             duration: asset.duration,
             original_path: asset.original_path,
+            is_edited: asset.is_edited.unwrap_or(false),
         })
     }
 }
@@ -996,6 +1005,7 @@ mod tests {
             r#type: dto::AssetTypeEnum::Image,
             duration: None,
             original_path: original_path.map(ToOwned::to_owned),
+            is_edited: false,
         }
     }
 

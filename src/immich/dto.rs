@@ -220,6 +220,12 @@ pub struct AssetResponseDto {
     /// before the field was modelled at all.
     #[serde(default)]
     pub visibility: Option<AssetVisibility>,
+    /// Spec-required, but still marked Beta upstream (`x-immich-state`), so modelled as
+    /// `Option` for the same forward-compatibility reason as `visibility`. `None` means "not
+    /// edited", i.e. treat `checksum` as describing the downloaded bytes — what this tool did
+    /// before the field was modelled at all.
+    #[serde(default)]
+    pub is_edited: Option<bool>,
 }
 
 /// `SearchResponseDto` — the top-level `POST /search/metadata` response. `jq

@@ -313,6 +313,13 @@ this and the program has to download one once to learn what it really is. `CACHE
 where it remembers that, which is why losing the cache can cost a large re-download. Albums
 without external-library assets are unaffected either way.
 
+**Edited assets** (cropped, rotated, … in the export side's web UI) are mirrored as the
+edit — a share link can't download the unedited original. The cache remembers which edit
+was imported, so if the owner edits the asset again later, the new version is *not* imported
+alongside it; and an asset that was mirrored before it was edited keeps its unedited copy.
+Losing the cache gives up that protection: a re-edit made afterwards would be imported as a
+second copy.
+
 ## Known limitations
 
 * **Live photos**: the motion-video half is skipped. Embedded motion photos

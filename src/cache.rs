@@ -22,6 +22,17 @@
 //! as this module is concerned, never parsed or validated here. Two jobs sharing an export
 //! instance therefore share entries too, which is the main practical win of running them in
 //! one process: only the first of them pays the cold download.
+//!
+//! **Edited assets are the one exception to "losing it only costs work".** A shared link
+//! can only download the edited render of an asset edited on the export side, while its
+//! listed checksum stays the original's (see `SourceAsset::is_edited`). Each re-edit there
+//! produces new bytes with a new content hash, which the import instance's dedup would
+//! happily accept as a brand-new photo. So for an edited asset this cache records, keyed by
+//! the original checksum, which render was imported first, and `sync.rs` keeps
+//! deduplicating against *that* render from then on, however often the owner edits again.
+//! These entries are *sticky*: [`ContentHashCache::get_sticky`] ignores `modified`, and the
+//! TTL prune never drops them. Losing one means a later re-edit can be imported as a second
+//! copy — the price of not having anything on the import side to look the mapping up by.
 
 use std::collections::HashMap;
 use std::fs;
@@ -59,6 +70,13 @@ struct Entry {
     /// entry a job keeps using every tick never expires, and one nothing looks up any more
     /// ages out within [`TTL_DAYS`].
     last_seen: DateTime<Utc>,
+    /// An edited-asset entry (see the module doc): looked up only via
+    /// [`ContentHashCache::get_sticky`], never via [`ContentHashCache::get`], and exempt from
+    /// the TTL prune. Defaulted and omitted when false, so v2 files written before this field
+    /// existed load unchanged and ordinary entries serialize exactly as they always have —
+    /// which is why adding it did not bump [`CURRENT_VERSION`].
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    sticky: bool,
 }
 
 /// The on-disk shape, one file's worth. Kept as its own type (rather than serializing
@@ -156,7 +174,7 @@ impl ContentHashCache {
     ) -> Option<String> {
         let mut entries = self.entries.lock().unwrap();
         let entry = entries.get_mut(instance)?.get_mut(path_checksum)?;
-        if entry.modified != modified {
+        if entry.sticky || entry.modified != modified {
             return None;
         }
         entry.last_seen = Utc::now();
@@ -172,19 +190,65 @@ impl ContentHashCache {
         modified: DateTime<Utc>,
         content_checksum: String,
     ) {
+        self.insert_entry(instance, path_checksum, modified, content_checksum, false);
+    }
+
+    /// The content hash of the render of an edited asset that was imported first, keyed by
+    /// the asset's listed (original) checksum — regardless of any timestamp, since the whole
+    /// point is to keep matching that render after the owner edits again (see the module
+    /// doc). Refreshes `last_seen` like [`Self::get`], though for a sticky entry that is only
+    /// informational.
+    pub fn get_sticky(&self, instance: &str, original_checksum: &str) -> Option<String> {
+        let mut entries = self.entries.lock().unwrap();
+        let entry = entries.get_mut(instance)?.get_mut(original_checksum)?;
+        if !entry.sticky {
+            return None;
+        }
+        entry.last_seen = Utc::now();
+        Some(entry.content.clone())
+    }
+
+    /// Records the render of an edited asset that was just imported, overwriting any
+    /// existing entry for this instance's original checksum. `modified` is stored only so the
+    /// entry has the same shape as every other one; [`Self::get_sticky`] never compares it.
+    pub fn insert_sticky(
+        &self,
+        instance: &str,
+        original_checksum: String,
+        modified: DateTime<Utc>,
+        content_checksum: String,
+    ) {
+        self.insert_entry(
+            instance,
+            original_checksum,
+            modified,
+            content_checksum,
+            true,
+        );
+    }
+
+    fn insert_entry(
+        &self,
+        instance: &str,
+        key: String,
+        modified: DateTime<Utc>,
+        content_checksum: String,
+        sticky: bool,
+    ) {
         let mut entries = self.entries.lock().unwrap();
         entries.entry(instance.to_owned()).or_default().insert(
-            path_checksum,
+            key,
             Entry {
                 modified,
                 content: content_checksum,
                 last_seen: Utc::now(),
+                sticky,
             },
         );
     }
 
-    /// Writes the cache to disk, first pruning entries whose `last_seen` is older than
-    /// [`TTL_DAYS`] (dropping an instance's map entirely once it's empty, so a retired export
+    /// Writes the cache to disk, first pruning non-sticky entries whose `last_seen` is older
+    /// than [`TTL_DAYS`] (dropping an instance's map entirely once it's empty, so a retired export
     /// instance doesn't leave a dead key behind forever). A no-op when disabled. Errors are
     /// returned, not logged, so the caller decides how loud a failed save should be.
     ///
@@ -234,7 +298,7 @@ impl ContentHashCache {
         let cutoff = now - chrono::Duration::days(TTL_DAYS);
         let mut entries = self.entries.lock().unwrap();
         for instance_entries in entries.values_mut() {
-            instance_entries.retain(|_, entry| entry.last_seen > cutoff);
+            instance_entries.retain(|_, entry| entry.sticky || entry.last_seen > cutoff);
         }
         entries.retain(|_, instance_entries| !instance_entries.is_empty());
     }
@@ -421,6 +485,7 @@ mod tests {
                     modified,
                     content: "content-a".to_string(),
                     last_seen: now - chrono::Duration::days(TTL_DAYS + 10),
+                    sticky: false,
                 },
             );
         }
@@ -498,6 +563,69 @@ mod tests {
 
         assert_eq!(cache.entry_count(), 0);
         assert!(!cache.entries.lock().unwrap().contains_key(INSTANCE_A));
+    }
+
+    #[test]
+    fn a_sticky_entry_ignores_modified_survives_pruning_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ContentHashCache::open(dir.path()).unwrap();
+        let modified = sample_modified();
+        let now = Utc::now();
+
+        cache.insert_sticky(
+            INSTANCE_A,
+            "original".to_string(),
+            modified,
+            "first-edit".to_string(),
+        );
+        {
+            let mut entries = cache.entries.lock().unwrap();
+            entries
+                .get_mut(INSTANCE_A)
+                .unwrap()
+                .get_mut("original")
+                .unwrap()
+                .last_seen = now - chrono::Duration::days(TTL_DAYS + 1);
+        }
+        cache.prune(now);
+        cache.persist().unwrap();
+
+        let reopened = ContentHashCache::open(dir.path()).unwrap();
+        assert_eq!(
+            reopened.get_sticky(INSTANCE_A, "original"),
+            Some("first-edit".to_string())
+        );
+        // A sticky entry is invisible to the path-hash lookup, whatever timestamp it asks for.
+        assert_eq!(reopened.get(INSTANCE_A, "original", modified), None);
+    }
+
+    #[test]
+    fn get_sticky_ignores_an_ordinary_entry() {
+        let cache = ContentHashCache::disabled();
+        let modified = sample_modified();
+        cache.insert(
+            INSTANCE_A,
+            "hash-a".to_string(),
+            modified,
+            "content-a".to_string(),
+        );
+        assert_eq!(cache.get_sticky(INSTANCE_A, "hash-a"), None);
+    }
+
+    #[test]
+    fn a_v2_file_without_the_sticky_field_still_loads() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(
+            dir.path().join(FILE_NAME),
+            br#"{"version":2,"instances":{"https://export-a.example.com/api":{"hash-a":{"modified":"2025-07-30T14:04:03Z","content":"content-a","last_seen":"2099-01-01T00:00:00Z"}}}}"#,
+        )
+        .unwrap();
+
+        let cache = ContentHashCache::open(dir.path()).unwrap();
+        assert_eq!(
+            cache.get(INSTANCE_A, "hash-a", sample_modified()),
+            Some("content-a".to_string())
+        );
     }
 
     #[test]
