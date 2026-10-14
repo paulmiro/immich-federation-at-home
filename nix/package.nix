@@ -51,7 +51,7 @@
         strictDeps = true;
 
         pname = "immich-federation-at-home";
-        version = "0.3.1";
+        version = "0.3.2";
 
         meta.mainProgram = "immich-federation-at-home";
       }
