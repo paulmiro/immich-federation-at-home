@@ -516,9 +516,13 @@ impl ExportClient {
         asset_id: Uuid,
         writer: &mut (impl AsyncWrite + Unpin),
     ) -> Result<DownloadOutcome, ExportError> {
-        let url = self
+        // `edited=false` pins the pristine original. For an asset edited in the web UI the
+        // server otherwise may serve the edited render, whose SHA-1 can never equal the
+        // original's `checksum` (and which is not what we want to replicate anyway).
+        let mut url = self
             .share_ref
             .apply(self.url(&format!("/assets/{asset_id}/original")));
+        url.query_pairs_mut().append_pair("edited", "false");
         let request = self.transfer_client.get(url.clone());
         let response = execute_once(Method::GET, &url, request).await?;
         let status = response.status();
