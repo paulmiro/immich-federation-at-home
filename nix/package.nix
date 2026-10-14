@@ -46,14 +46,15 @@
         depsBuildBuild = [ targetPkgs.pkgsBuildBuild.stdenv.cc ];
       };
 
+      crateInfo = craneLib.crateNameFromCargoToml { cargoToml = ../Cargo.toml; };
+
       commonArgs = {
         inherit src;
         strictDeps = true;
 
-        pname = "immich-federation-at-home";
-        version = "0.3.1";
+        inherit (crateInfo) pname version;
 
-        meta.mainProgram = "immich-federation-at-home";
+        meta.mainProgram = crateInfo.pname;
       }
       // cargoTargetArgs pkgs;
 
